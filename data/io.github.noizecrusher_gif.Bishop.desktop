@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Bishop
+GenericName=Terminal
+Comment=A terminal with a built-in AI assistant
+Exec=bishop
+Icon=io.github.noizecrusher_gif.Bishop
+Terminal=false
+Categories=System;TerminalEmulator;GTK;
+Keywords=shell;prompt;command;commandline;cmd;ai;claude;assistant;
+StartupNotify=true
+StartupWMClass=io.github.noizecrusher_gif.Bishop
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=bishop
