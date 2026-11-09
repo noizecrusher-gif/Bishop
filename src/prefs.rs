@@ -257,9 +257,23 @@ pub fn show_agent_config(parent: &impl IsA<gtk::Widget>, restart: impl Fn() + 's
         .title("Privacy")
         .description(
             "Claude reads your terminal only when it uses a Bishop tool. What it reads is sent to \
-             Anthropic to generate responses, so avoid displaying secrets while the agent is working.",
+             Anthropic to generate responses.",
         )
         .build();
+    let hide_secrets = adw::SwitchRow::builder()
+        .title("Hide Secrets from Claude")
+        .subtitle(
+            "Private keys, API and cloud tokens, and passwords Bishop recognizes on screen are \
+             replaced before Claude sees them, and in the activity log. Not every secret can be \
+             recognized, so still avoid displaying them while the agent works.",
+        )
+        .active(!agent.share_secrets)
+        .build();
+    hide_secrets.connect_active_notify(|row| {
+        let share = !row.is_active();
+        settings::update(|s| s.agent.share_secrets = share);
+    });
+    privacy.add(&hide_secrets);
     page.add(&privacy);
 
     let actions = adw::PreferencesGroup::new();
@@ -308,7 +322,7 @@ fn open_personal_notes(dialog: &adw::PreferencesDialog) {
         let template = "# My notes for Bishop's agent\n\n\
                         Claude reads this file at the start of every agent session. Add anything \
                         it should know: hosts you manage, preferred tools, things to avoid.\n";
-        if let Err(e) = std::fs::create_dir_all(crate::window::agent_dir())
+        if let Err(e) = crate::safety::private_dir(&crate::window::agent_dir())
             .and_then(|()| std::fs::write(&path, template))
         {
             dialog.add_toast(adw::Toast::new(&format!("Could not create {}: {e}", path.display())));

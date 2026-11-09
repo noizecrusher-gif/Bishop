@@ -77,6 +77,35 @@ Then `cargo build --release` builds `target/release/bishop`. On Debian-based sys
 
 For development, `cargo run` starts Bishop from the source tree.
 
+## Security
+
+Bishop gives an AI agent your terminal, so it's built to keep that contained:
+
+- **Only that tab's Claude can drive it.** Each tab's agent socket is private to your account
+  and only accepts the bridge started by that tab's own Claude Code process; other programs,
+  even ones running as you, are refused.
+- **Claude Code runs locked down:** no tools of its own, only Bishop's MCP server, only your
+  user-level settings (never project settings), and no hooks.
+- **Approvals:** with automatic mode off you approve everything the agent types. Destructive
+  commands, anything run as root (`sudo`…), commands recalled from history or scheduled for
+  later, and changes to shell startup files, SSH keys or Bishop's and Claude's own settings
+  always need approval. Approvals show hidden characters, always show the end of long input,
+  apply to one input at a time, and are re-checked before typing. These rules are a safety net,
+  not a guarantee: read what you approve.
+- **Secrets:** recognizable private keys, tokens and passwords on screen are hidden before the
+  agent sees them (Agent Configuration → Hide Secrets from Claude). The agent can never type at
+  a password prompt.
+- **Audit log:** everything the agent types is logged to `~/.local/state/bishop/audit.log`
+  (private to you) and to the system journal (`journalctl --user -t bishop` or
+  `journalctl -t bishop`), which programs running as you can't edit.
+- **Emergency Stop** terminates what the agent started; "Force Stop as Administrator" runs only
+  root-owned system programs and re-checks each process just before killing it.
+- **Releases** are built by GitHub Actions with pinned actions, smoke-tested on each distribution,
+  and carry signed build provenance: `gh attestation verify <file> --repo noizecrusher-gif/Bishop`.
+
+Report security problems privately through GitHub's
+[security advisories](https://github.com/noizecrusher-gif/Bishop/security/advisories/new).
+
 ## Files
 
 | Path | Contents |
@@ -84,7 +113,7 @@ For development, `cargo run` starts Bishop from the source tree.
 | `~/.config/bishop/config.toml` | Settings |
 | `~/.config/bishop/themes/` | Saved themes |
 | `~/.local/share/bishop/agent/` | The agent's workspace; put your own instructions for it in `CLAUDE.local.md` |
-| `~/.local/state/bishop/audit.log` | Everything the agent typed |
+| `~/.local/state/bishop/audit.log` | Everything the agent typed (secrets hidden) |
 | `$XDG_RUNTIME_DIR/bishop/` | Each tab's agent socket and shell-integration channel, and the shell hooks |
 
 ## License

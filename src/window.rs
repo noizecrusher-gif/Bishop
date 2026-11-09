@@ -39,6 +39,12 @@ const AGENT_EXIT_GRACE: Duration = Duration::from_secs(3);
 /// automatic mode can be switched while Claude is running.
 const ALLOWED_TOOLS: &str = "mcp__bishop__*";
 
+/// Claude Code reads only the user's own settings, never project settings in its workspace
+/// (which the agent could write with commands it types), and runs no hooks: a hook would run
+/// commands outside Bishop's approvals, audit log and Emergency Stop.
+const SETTING_SOURCES: &str = "user";
+const LOCKED_SETTINGS: &str = r#"{"disableAllHooks":true}"#;
+
 const AGENT_PROMPT: &str = "You are the assistant built into Bishop, a Linux terminal emulator. \
 When the user mentions their terminal, screen, shell, or session, they mean the Bishop terminal \
 session you reach through the `bishop` MCP tools: the terminal in your own Bishop tab. Follow the \
@@ -1001,6 +1007,10 @@ impl Session {
             "",
             "--allowedTools",
             ALLOWED_TOOLS,
+            "--setting-sources",
+            SETTING_SOURCES,
+            "--settings",
+            LOCKED_SETTINGS,
             "--append-system-prompt",
             AGENT_PROMPT,
         ];
@@ -1015,6 +1025,9 @@ impl Session {
         spawn(&self.agent_terminal, &argv, &[], &workspace, move |pid| {
             if let Some(state) = state.upgrade() {
                 state.agent_pid.set(Some(pid));
+                if let Some(server) = state.mcp_server.borrow().as_ref() {
+                    server.set_agent(pid.0);
+                }
             }
         });
     }
@@ -1192,7 +1205,7 @@ pub fn agent_dir() -> PathBuf {
 /// share their memory.
 fn agent_workspace() -> std::io::Result<PathBuf> {
     let dir = agent_dir();
-    std::fs::create_dir_all(&dir)?;
+    crate::safety::private_dir(&dir)?;
     std::fs::write(dir.join("CLAUDE.md"), AGENT_GUIDE)?;
     Ok(dir)
 }

@@ -168,6 +168,9 @@ pub struct Agent {
     /// Empty means Claude Code's default; otherwise passed to `--model`.
     pub model: String,
     pub automatic_mode: bool,
+    /// Send recognizable secrets (keys, tokens, passwords) on screen to the model as they are.
+    /// Off by default: Bishop hides them.
+    pub share_secrets: bool,
 }
 
 impl Agent {
@@ -376,7 +379,7 @@ fn write_theme(dir: &Path, name: &str, appearance: &Appearance) -> std::io::Resu
         font_size: appearance.font_size,
         colors: appearance.colors(),
     };
-    std::fs::create_dir_all(dir)?;
+    crate::safety::private_dir(dir)?;
     let text = toml::to_string_pretty(&theme).map_err(std::io::Error::other)?;
     std::fs::write(dir.join(format!("{stem}.toml")), text)?;
     Ok(theme)
@@ -487,7 +490,7 @@ pub fn subscribe(listener: impl Fn(&Settings) -> bool + 'static) {
 fn save(settings: &Settings) -> std::io::Result<()> {
     let path = path();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::safety::private_dir(dir)?;
     }
     let text = toml::to_string_pretty(settings).map_err(std::io::Error::other)?;
     std::fs::write(path, text)

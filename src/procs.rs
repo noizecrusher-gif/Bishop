@@ -79,6 +79,26 @@ fn read(pid: i32) -> Option<Process> {
     Some(Process { pid, pgrp, session, uid, start, command })
 }
 
+/// The parent of `pid`, from `/proc/<pid>/stat`.
+pub fn parent(pid: i32) -> Option<i32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 1..].split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Whether `pid` is `ancestor` or one of its descendants.
+pub fn descends_from(mut pid: i32, ancestor: i32) -> bool {
+    for _ in 0..64 {
+        if pid == ancestor {
+            return true;
+        }
+        match parent(pid) {
+            Some(next) if next > 0 && next != pid => pid = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// The current time in the clock ticks `/proc` uses for process start times.
 pub fn now_ticks() -> u64 {
     let uptime: f64 = fs::read_to_string("/proc/uptime")
@@ -133,5 +153,8 @@ mod tests {
         assert_eq!(found.uid, unsafe { libc::getuid() });
         assert!(in_group(found.pgrp).iter().any(|p| p.pid == me));
         assert!(found.start > 0 && found.start <= now_ticks());
+        let parent = parent(me).expect("has a parent");
+        assert!(descends_from(me, parent) && descends_from(me, me));
+        assert!(!descends_from(parent, me));
     }
 }

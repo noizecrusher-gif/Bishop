@@ -287,27 +287,36 @@ impl Session {
         if foreign && pkexec {
             dialog.add_response("force", "Force Stop as Administrator");
             dialog.set_response_appearance("force", adw::ResponseAppearance::Destructive);
-            dialog.set_default_response(Some("force"));
         }
+        // Closing is the default: running something as root takes a deliberate click.
+        dialog.set_default_response(Some("close"));
+        dialog.set_close_response("close");
+        let targets: Vec<(i32, u64)> = survivors.iter().map(|p| (p.pid, p.start)).collect();
         let state = Rc::downgrade(self);
         dialog.connect_response(Some("force"), move |_, _| {
             if let Some(state) = state.upgrade() {
-                let pids = pids.clone();
-                glib::spawn_future_local(async move { state.force_kill_as_admin(&pids).await });
+                let targets = targets.clone();
+                glib::spawn_future_local(async move { state.force_kill_as_admin(&targets).await });
             }
         });
         dialog.present(Some(&self.window));
     }
 
     /// SIGKILLs processes owned by other users, after the system asks for an administrator
-    /// password (polkit, via pkexec).
-    async fn force_kill_as_admin(self: &Rc<Self>, pids: &[i32]) {
-        let Some(kill) = glib::find_program_in_path("kill") else {
-            self.toast("Could not find the `kill` program");
+    /// password (polkit, via pkexec). Only root-owned programs at fixed paths are run, never
+    /// whatever is first on PATH. The root side re-checks each process's start time just
+    /// before killing it, so a PID reused by another process meanwhile is left alone.
+    async fn force_kill_as_admin(self: &Rc<Self>, targets: &[(i32, u64)]) {
+        let (Some(pkexec), Some(sh)) =
+            (trusted_program(&["/usr/bin/pkexec", "/bin/pkexec"]), trusted_program(&["/bin/sh", "/usr/bin/sh"]))
+        else {
+            self.toast("pkexec isn't installed (or isn't owned by root), so Bishop can't ask for administrator rights");
             return;
         };
-        let mut argv = vec!["pkexec".to_owned(), kill.to_string_lossy().into_owned(), "-KILL".into(), "--".into()];
-        argv.extend(pids.iter().map(i32::to_string));
+        let pids: Vec<i32> = targets.iter().map(|(pid, _)| *pid).collect();
+        let mut argv: Vec<String> =
+            vec![pkexec.display().to_string(), sh.display().to_string(), "-c".into(), KILL_IF_SAME.into(), "bishop".into()];
+        argv.extend(targets.iter().map(|(pid, start)| format!("{pid}:{start}")));
         let argv: Vec<&std::ffi::OsStr> = argv.iter().map(|a| a.as_ref()).collect();
         let result = match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
             Ok(process) => process.wait_future().await.map(|()| process.exit_status()),
@@ -323,6 +332,32 @@ impl Session {
         self.audit("emergency_stop", &format!("{pids:?}"), message, None);
         self.toast(message);
     }
+}
+
+/// Run as root by `force_kill_as_admin`, with `<pid>:<start time>` arguments: kills each process
+/// only if it still has that start time (field 22 of /proc/<pid>/stat), using shell builtins only.
+const KILL_IF_SAME: &str = r#"for target; do
+    pid=${target%%:*}; start=${target#*:}
+    case $pid$start in *[!0-9]*|'') continue ;; esac
+    read -r stat < "/proc/$pid/stat" 2>/dev/null || continue
+    set -f; set -- ${stat##*) }; set +f
+    shift 19
+    [ "$1" = "$start" ] && kill -KILL "$pid"
+done
+exit 0"#;
+
+/// The first of `paths` that is a root-owned file in a root-owned directory, neither writable
+/// by anyone else.
+fn trusted_program(paths: &[&str]) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let safe = |path: &std::path::Path| {
+        std::fs::metadata(path).is_ok_and(|meta| meta.uid() == 0 && meta.mode() & 0o022 == 0)
+    };
+    paths.iter().map(std::path::PathBuf::from).find(|path| {
+        // Resolve symlinks (e.g. /bin -> usr/bin) and check what actually runs.
+        let Ok(real) = std::fs::canonicalize(path) else { return false };
+        safe(&real) && real.parent().is_some_and(safe)
+    })
 }
 
 /// SIGTERM, then SIGKILL, each process; returns any still alive afterwards.

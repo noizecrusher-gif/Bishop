@@ -32,7 +32,8 @@ xvfb=$!
 export DISPLAY=:87 GDK_BACKEND=x11 GSK_RENDERER=cairo LIBGL_ALWAYS_SOFTWARE=1 GTK_A11Y=none
 sleep 1
 
-dbus-run-session -- bishop >"$work/log" 2>&1 &
+# The test client is not Claude Code, so let it connect (see BISHOP_TEST_ANY_MCP_CLIENT in src/mcp.rs).
+BISHOP_TEST_ANY_MCP_CLIENT=1 dbus-run-session -- bishop >"$work/log" 2>&1 &
 app=$!
 
 for _ in $(seq 1 60); do

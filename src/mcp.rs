@@ -4,12 +4,13 @@
 //! handler as `ToolRequest`s and the answer comes back over a std channel.
 
 use std::fs::{self, Permissions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::net::Shutdown;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -53,18 +54,39 @@ fn remove_stale_files(dir: &Path) {
     }
 }
 
+/// Longest request line accepted; a client sending more is disconnected.
+const MAX_LINE: u64 = 1024 * 1024;
+/// Requests one connection may have in flight at once; reading pauses beyond this.
+const MAX_IN_FLIGHT: usize = 32;
+/// How long a connecting client may wait for Bishop to learn Claude's PID after starting it.
+const AGENT_PID_WAIT: Duration = Duration::from_secs(5);
+/// Set in Bishop's environment (only by the packaging smoke test) to accept clients that
+/// aren't descended from the tab's Claude Code.
+const ANY_CLIENT_FOR_TESTS: &str = "BISHOP_TEST_ANY_MCP_CLIENT";
+
 /// A running server. `disconnect` cuts the agent off for good.
+///
+/// Only the tab's own agent may connect: the peer (from `SO_PEERCRED`) must run as this user
+/// and descend from the Claude Code process Bishop started for the tab. Other processes of
+/// the same user, even ones the kernel's ptrace protection keeps away from this terminal,
+/// can't use the socket to read the screen or type.
 pub struct Server {
     path: PathBuf,
     tx: async_channel::Sender<ToolRequest>,
     disconnected: Arc<AtomicBool>,
     connections: Connections,
+    agent: Arc<AtomicI32>,
 }
 
 /// Open connections by id, so Hard Stop can cut them off.
 type Connections = Arc<Mutex<Vec<(u64, UnixStream)>>>;
 
 impl Server {
+    /// The PID of the Claude Code process the tab started; only its descendants may connect.
+    pub fn set_agent(&self, pid: i32) {
+        self.agent.store(pid, Ordering::SeqCst);
+    }
+
     /// Refuses all further requests, closes every open connection, and removes the socket so
     /// nothing can reconnect.
     pub fn disconnect(&self) {
@@ -90,8 +112,11 @@ pub fn serve(path: &Path, tx: async_channel::Sender<ToolRequest>) -> std::io::Re
         tx: tx.clone(),
         disconnected: Arc::new(AtomicBool::new(false)),
         connections: Arc::new(Mutex::new(Vec::new())),
+        agent: Arc::new(AtomicI32::new(0)),
     };
-    let (disconnected, connections) = (server.disconnected.clone(), server.connections.clone());
+    let (disconnected, connections, agent) =
+        (server.disconnected.clone(), server.connections.clone(), server.agent.clone());
+    let any_client = std::env::var_os(ANY_CLIENT_FOR_TESTS).is_some();
     std::thread::spawn(move || {
         for (id, conn) in (0u64..).zip(listener.incoming().flatten()) {
             if disconnected.load(Ordering::SeqCst) {
@@ -100,9 +125,14 @@ pub fn serve(path: &Path, tx: async_channel::Sender<ToolRequest>) -> std::io::Re
             if let (Ok(clone), Ok(mut list)) = (conn.try_clone(), connections.lock()) {
                 list.push((id, clone));
             }
-            let (tx, disconnected, connections) = (tx.clone(), disconnected.clone(), connections.clone());
+            let (tx, disconnected, connections, agent) =
+                (tx.clone(), disconnected.clone(), connections.clone(), agent.clone());
             std::thread::spawn(move || {
-                handle_connection(conn, tx, disconnected);
+                if any_client || is_agent(&conn, &agent) {
+                    handle_connection(conn, tx, disconnected);
+                } else {
+                    let _ = conn.shutdown(Shutdown::Both);
+                }
                 if let Ok(mut list) = connections.lock() {
                     list.retain(|(other, _)| *other != id);
                 }
@@ -115,18 +145,28 @@ pub fn serve(path: &Path, tx: async_channel::Sender<ToolRequest>) -> std::io::Re
 fn handle_connection(conn: UnixStream, tx: async_channel::Sender<ToolRequest>, disconnected: Arc<AtomicBool>) {
     let Ok(out) = conn.try_clone() else { return };
     let out = Arc::new(Mutex::new(out));
-    let mut requests = Vec::new();
-    for line in BufReader::new(conn).lines() {
-        let Ok(line) = line else { break };
+    let mut requests: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut reader = BufReader::new(conn);
+    loop {
+        let mut raw = Vec::new();
+        match (&mut reader).take(MAX_LINE + 1).read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if raw.len() as u64 > MAX_LINE => break,
+            Ok(_) => {}
+        }
         if disconnected.load(Ordering::SeqCst) {
             break;
         }
+        let Ok(line) = String::from_utf8(raw) else { continue };
         if line.trim().is_empty() {
             continue;
         }
         // One thread per request: a send_keys awaiting approval must not block reads.
         let (tx, out) = (tx.clone(), out.clone());
-        requests.retain(|request: &std::thread::JoinHandle<()>| !request.is_finished());
+        requests.retain(|request| !request.is_finished());
+        while requests.len() >= MAX_IN_FLIGHT {
+            let _ = requests.remove(0).join();
+        }
         requests.push(std::thread::spawn(move || {
             if let Some(response) = handle_message(&line, &tx)
                 && let Ok(mut out) = out.lock()
@@ -142,6 +182,42 @@ fn handle_connection(conn: UnixStream, tx: async_channel::Sender<ToolRequest>, d
     if let Ok(out) = out.lock() {
         let _ = out.shutdown(Shutdown::Both);
     }
+}
+
+/// Whether the connecting process runs as this user and descends from the tab's Claude Code.
+fn is_agent(conn: &UnixStream, agent: &AtomicI32) -> bool {
+    let Some((pid, uid)) = peer(conn) else { return false };
+    if uid != unsafe { libc::getuid() } {
+        return false;
+    }
+    // Claude can start the bridge before Bishop has recorded its PID.
+    let deadline = std::time::Instant::now() + AGENT_PID_WAIT;
+    loop {
+        let agent = agent.load(Ordering::SeqCst);
+        if agent > 0 {
+            return crate::procs::descends_from(pid, agent);
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The connecting process's PID and user, as the kernel recorded them at `connect`.
+fn peer(conn: &UnixStream) -> Option<(i32, u32)> {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ok = unsafe {
+        libc::getsockopt(
+            conn.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        )
+    } == 0;
+    (ok && cred.pid > 0).then_some((cred.pid, cred.uid))
 }
 
 fn handle_message(line: &str, tx: &async_channel::Sender<ToolRequest>) -> Option<Value> {

@@ -29,6 +29,18 @@ pub(super) const STOPPED: &str = "Emergency stop: the user stopped you and termi
 command. Bishop refuses all input from you until the user resumes the agent. Do not retry. Tell \
 the user what you were doing when you were stopped, and wait for their instructions.";
 const HARD_STOPPED: &str = "Hard stop: the user disconnected you from this terminal.";
+const BUSY: &str = "Another input of yours is still waiting for the user's approval. Wait for \
+that call to return before sending more.";
+const CHANGED: &str = "Not typed: while the user was approving, the terminal changed (a different \
+program is now in front, or it is at a password prompt). Read the screen and ask again.";
+const NOT_PRINTABLE: &str = "`text` must be printable. Send Enter, Tab, Escape, Ctrl-C and other \
+control keys with `keys`.";
+/// Keys that bring back a line from shell history: what they submit can't be checked.
+const HISTORY_KEYS: &[&[u8]] =
+    &[b"\x1b[A", b"\x1bOA", b"\x1b[B", b"\x1bOB", b"\x10", b"\x0e", b"\x12", b"\x1b.", b"\x1b_"];
+/// After the approval bar shows a new request, its buttons wait this long, so a click meant
+/// for something else can't approve it.
+const APPROVAL_ARM: Duration = Duration::from_millis(800);
 const PASSWORD_BLOCKED: &str = "Blocked: the terminal is at a password prompt, and Bishop never \
 lets the agent type there. Ask the user to enter it themselves (you may send only ctrl-c to cancel).";
 
@@ -73,7 +85,7 @@ impl Session {
         if self.hard_stopped.get() {
             return Err(HARD_STOPPED.into());
         }
-        match name {
+        let result = match name {
             "read_screen" => Ok(self.screen_text()),
             "read_scrollback" => {
                 let lines = args["lines"].as_i64().unwrap_or(200).clamp(1, 5000);
@@ -84,10 +96,15 @@ impl Session {
             "run_command" => self.run_command(args).await,
             "wait_for" => self.wait_for(args).await,
             _ => Err(format!("unknown tool: {name}")),
-        }
+        };
+        // What the model sees: recognizable secrets are hidden unless the user opted out.
+        if crate::settings::get().agent.share_secrets { result } else { result.map(|text| safety::redact(&text)) }
     }
 
     async fn send_keys(self: &Rc<Self>, args: &Value) -> Result<String, String> {
+        if args["text"].as_str().is_some_and(|text| text.chars().any(char::is_control)) {
+            return Err(NOT_PRINTABLE.into());
+        }
         let bytes = encode_input(args)?;
         if bytes.is_empty() {
             return Err("nothing to send: provide `text` and/or `keys`".into());
@@ -108,9 +125,12 @@ impl Session {
         if command.contains(['\n', '\r']) {
             return Err("Run one command per call: `command` must not contain newlines.".into());
         }
+        if command.chars().any(char::is_control) {
+            return Err("`command` must not contain control characters.".into());
+        }
         let timeout = Duration::from_millis(args["timeout_ms"].as_u64().unwrap_or(30_000).clamp(1_000, 600_000));
         let bytes = format!("{command}\r").into_bytes();
-        self.authorize("run_command", &format!("{command} ⏎"), &bytes).await?;
+        self.authorize("run_command", &format!("{} ⏎", safety::visible(command)), &bytes).await?;
 
         let _busy = Busy::new(self);
         let generation = self.cancel_generation.get();
@@ -273,16 +293,20 @@ impl Session {
             return Err(PASSWORD_BLOCKED.into());
         }
 
-        // Text typed now, and on Enter the whole command line (it may have been typed earlier).
-        let submits = bytes.contains(&b'\r');
-        let warning = safety::dangerous(&String::from_utf8_lossy(bytes))
-            .or_else(|| submits.then(|| safety::dangerous(&self.cursor_line())).flatten());
-
+        let warning = self.warning_for(bytes);
+        // Nothing is typed while an approval is pending: the approval applies to what the bar
+        // shows, in the terminal as the user sees it (even harmless input, like `cd`, could
+        // change what an approved command does).
+        if self.pending_approval.borrow().is_some() {
+            self.audit(tool, display, "refused: another input awaits approval", warning);
+            return Err(BUSY.into());
+        }
         if self.auto_mode.get() && warning.is_none() {
             self.audit(tool, display, "automatic", None);
             return Ok(());
         }
         let generation = self.cancel_generation.get();
+        let foreground = self.foreground_group();
         let approved = self.request_approval(display, warning).await;
         if self.cancel_generation.get() != generation {
             self.audit(tool, display, "interrupted", warning);
@@ -292,16 +316,45 @@ impl Session {
             self.audit(tool, display, "denied", warning);
             return Err(DECLINED.into());
         }
+        // The wait can be long: what was approved must still be what will be typed into.
+        let (_, password_prompt) = self.pty_state();
+        if self.stopped.get() {
+            return Err(STOPPED.into());
+        }
+        if (password_prompt && bytes != b"\x03") || self.foreground_group() != foreground {
+            self.audit(tool, display, "refused: terminal changed while waiting", warning);
+            return Err(CHANGED.into());
+        }
         self.audit(tool, display, "approved", warning);
         Ok(())
     }
 
+    /// Why `bytes` needs the user's approval regardless of automatic mode, if it does.
+    fn warning_for(&self, bytes: &[u8]) -> Option<&'static str> {
+        let typed = String::from_utf8_lossy(bytes);
+        if safety::hidden_characters(&typed) {
+            return Some("contains invisible or direction-changing characters, so it may not be what it looks like");
+        }
+        // Enter, Ctrl-J and Ctrl-O all run the line.
+        let submits = bytes.iter().any(|b| matches!(b, b'\r' | b'\n' | 0x0f));
+        if submits && HISTORY_KEYS.iter().any(|key| bytes.windows(key.len()).any(|w| w == *key)) {
+            return Some("runs a line recalled from shell history, which Bishop can't check");
+        }
+        safety::dangerous(&typed).or_else(|| {
+            // On submit, the whole command line: what's already there (it may wrap over several
+            // rows, or have been typed earlier) followed by what's typed now.
+            submits.then(|| safety::dangerous(&format!("{}{typed}", self.command_line()))).flatten()
+        })
+    }
+
+    fn foreground_group(&self) -> Option<i32> {
+        let pty = self.terminal.pty()?;
+        Some(unsafe { libc::tcgetpgrp(pty.fd().as_raw_fd()) })
+    }
+
     async fn request_approval(&self, display: &str, warning: Option<&str>) -> bool {
         let (tx, rx) = async_channel::bounded(1);
-        // A newer request supersedes one still waiting.
-        if let Some(previous) = self.pending_approval.replace(Some(tx)) {
-            let _ = previous.try_send(false);
-        }
+        self.pending_approval.replace(Some(tx));
         self.close_approval_dialog();
         let bar = &self.approval;
         let warning_text = warning.map(|reason| format!("⚠ This looks destructive: it {reason}. Check it carefully."));
@@ -320,6 +373,7 @@ impl Session {
             bar.approve.add_css_class("suggested-action");
         }
         bar.revealer.set_reveal_child(true);
+        arm_after_delay(&bar.approve);
         self.refresh_tab();
         let approved = rx.recv().await.unwrap_or(false);
         if self.pending_approval.borrow().is_none() {
@@ -398,6 +452,7 @@ impl Session {
         toolbar.add_top_bar(&adw::HeaderBar::new());
         toolbar.set_content(Some(&scroller));
         toolbar.add_bottom_bar(&buttons);
+        arm_after_delay(&confirm);
         let dialog = adw::Window::builder()
             .title("Review Claude's Input")
             .transient_for(&self.window)
@@ -597,6 +652,14 @@ impl Session {
         output
     }
 
+    /// The whole line the cursor is on, including rows it has wrapped onto: VTE joins soft-wrapped
+    /// rows without a newline, so it's whatever follows the last hard line break.
+    fn command_line(&self) -> String {
+        let row = self.terminal.cursor_position().1;
+        let text = self.text_between((row - 40).max(0), row, self.terminal.column_count());
+        text.rsplit('\n').next().unwrap_or_default().to_owned()
+    }
+
     pub(super) fn cursor_line(&self) -> String {
         let row = self.terminal.cursor_position().1;
         self.text_between(row, row, self.terminal.column_count())
@@ -653,12 +716,29 @@ impl Session {
     }
 }
 
-/// At most `max` characters of `text`, and whether any were cut.
+/// At most `max` characters of `text`, and whether any were cut. Long text keeps its start
+/// and its end, since a harmful part can hide at either.
 fn preview(text: &str, max: usize) -> (String, bool) {
-    match text.char_indices().nth(max) {
-        Some((end, _)) => (format!("{}…", text[..end].trim_end()), true),
-        None => (text.to_owned(), false),
+    let count = text.chars().count();
+    if count <= max {
+        return (text.to_owned(), false);
     }
+    let head: String = text.chars().take(max * 2 / 3).collect();
+    let tail: String = text.chars().skip(count - max / 3).collect();
+    (format!("{} … {}", head.trim_end(), tail.trim_start()), true)
+}
+
+/// Makes `button` clickable only after `APPROVAL_ARM`.
+fn arm_after_delay(button: &gtk::Button) {
+    button.set_sensitive(false);
+    glib::timeout_add_local_once(
+        APPROVAL_ARM,
+        glib::clone!(
+            #[weak]
+            button,
+            move || button.set_sensitive(true)
+        ),
+    );
 }
 
 /// Keeps the last `MAX_OUTPUT_LINES` lines, noting how many were left out.
@@ -701,7 +781,7 @@ pub(super) fn looks_like_prompt(line: &str) -> bool {
 
 /// Human-readable form of a `send_keys` request, e.g. `ls -la ⏎`.
 fn describe_input(args: &Value) -> String {
-    let mut out = args["text"].as_str().unwrap_or_default().to_owned();
+    let mut out = safety::visible(args["text"].as_str().unwrap_or_default());
     for key in args["keys"].as_array().into_iter().flatten() {
         let name = key.as_str().unwrap_or_default();
         let shown = match name.to_ascii_lowercase().as_str() {
@@ -787,8 +867,11 @@ mod tests {
         let long = "é".repeat(300);
         let (shown, cut) = preview(&long, PREVIEW_CHARS);
         assert!(cut);
-        assert_eq!(shown.chars().count(), PREVIEW_CHARS + 1);
-        assert!(shown.ends_with('…'));
+        assert!(shown.chars().count() <= PREVIEW_CHARS + 3);
+        assert!(shown.contains(" … "));
+        // The end is always shown.
+        let sneaky = format!("ls {}; rm -rf ~", "a".repeat(400));
+        assert!(preview(&sneaky, PREVIEW_CHARS).0.ends_with("rm -rf ~"));
     }
 
     #[test]

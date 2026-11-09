@@ -21,7 +21,9 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Check the tag matches Cargo.toml
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
@@ -32,10 +34,10 @@ jobs:
           sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
       - name: Install Rust and packaging tools
         run: |
-          command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          command -v rustup >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install stable --profile minimal && rustup default stable
-          cargo install --locked cargo-deb cargo-generate-rpm
+          cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: cargo test --locked
       - name: Build and package
@@ -47,7 +49,7 @@ jobs:
           mkdir dist
           cp target/debian/*.deb target/generate-rpm/*.rpm target/dist/*.tar.gz dist/
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.arch }}
           path: dist/
@@ -70,8 +72,10 @@ jobs:
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist-${{ matrix.arch }}
           path: dist
@@ -83,9 +87,14 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # Signed build provenance: `gh attestation verify <file> --repo noizecrusher-gif/Bishop`
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           path: dist
@@ -98,6 +107,10 @@ jobs:
             packaging/aur/PKGBUILD.in > dist/PKGBUILD
           (cd dist && sha256sum * > SHA256SUMS)
           cat dist/SHA256SUMS
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: 'dist/*'
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}

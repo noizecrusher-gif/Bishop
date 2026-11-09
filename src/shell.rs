@@ -9,7 +9,7 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +21,8 @@ const BASH_RC: &str = r#"# Bishop shell integration for bash. Bishop starts bash
 
 if [ -n "$BISHOP_EVENTS" ] && [ -z "$__bishop_loaded" ]; then
     __bishop_loaded=1
+    # Keep the channel to this shell: programs it runs don't inherit it, so they can't fake events.
+    export -n BISHOP_EVENTS
     __bishop_precmd() {
         local __bishop_status=$?
         [ -p "$BISHOP_EVENTS" ] && printf 'precmd %d\n' "$__bishop_status" >> "$BISHOP_EVENTS" 2>/dev/null
@@ -46,6 +48,8 @@ unset BISHOP_ZDOTDIR
 [[ -r ${ZDOTDIR:-$HOME}/.zshenv ]] && source ${ZDOTDIR:-$HOME}/.zshenv
 
 if [[ -o interactive && -n $BISHOP_EVENTS ]]; then
+    # Keep the channel to this shell: programs it runs don't inherit it, so they can't fake events.
+    typeset +x BISHOP_EVENTS
     __bishop_precmd() {
         local __bishop_status=$?
         [[ -p $BISHOP_EVENTS ]] && print -r -- "precmd $__bishop_status" >> $BISHOP_EVENTS 2>/dev/null
@@ -58,6 +62,8 @@ fi
 
 const FISH_INIT: &str = r#"# Bishop shell integration for fish, loaded with `--init-command` after the usual config.
 if set -q BISHOP_EVENTS; and status is-interactive
+    # Keep the channel to this shell: programs it runs don't inherit it, so they can't fake events.
+    set -gu BISHOP_EVENTS $BISHOP_EVENTS
     function __bishop_postexec --on-event fish_postexec
         set -l last $status
         test -p "$BISHOP_EVENTS"; and echo "precmd $last" >> "$BISHOP_EVENTS" 2>/dev/null
@@ -154,6 +160,9 @@ pub struct Events {
     writer: fs::File,
 }
 
+/// Events are a few bytes; longer lines are ignored.
+const MAX_LINE: u64 = 256;
+
 /// Written by `Events` itself to stop its reader thread.
 const QUIT: &[u8] = b"bishop-quit\n";
 
@@ -177,8 +186,26 @@ impl Events {
 
         let (tx, rx) = async_channel::unbounded::<Event>();
         std::thread::spawn(move || {
-            for line in BufReader::new(reader).split(b'\n') {
-                let Ok(line) = line else { break };
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut line = Vec::new();
+                match (&mut reader).take(MAX_LINE).read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                // Over-long lines (only something misbehaving writes those) are skipped whole.
+                if line.last() != Some(&b'\n') {
+                    loop {
+                        let mut rest = Vec::new();
+                        match (&mut reader).take(MAX_LINE).read_until(b'\n', &mut rest) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) if rest.last() == Some(&b'\n') => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    continue;
+                }
+                line.pop();
                 if line == QUIT[..QUIT.len() - 1] {
                     break;
                 }
