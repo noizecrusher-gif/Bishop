@@ -1,0 +1,104 @@
+# On a version tag (v0.11.0, …): build Bishop for x86_64 and aarch64, package it as .deb,
+# .rpm, a tarball and an AUR PKGBUILD, smoke-test every package in its distro's container,
+# and create a DRAFT GitHub release with all of them for you to review and publish.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME != Cargo.toml $version"; exit 1; }
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
+      - name: Install Rust and packaging tools
+        run: |
+          command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install stable --profile minimal && rustup default stable
+          cargo install --locked cargo-deb cargo-generate-rpm
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: cargo test --locked
+      - name: Build and package
+        run: |
+          cargo build --release --locked
+          cargo deb --no-build
+          cargo generate-rpm
+          packaging/make-tarball.sh ${{ matrix.arch }}
+          mkdir dist
+          cp target/debian/*.deb target/generate-rpm/*.rpm target/dist/*.tar.gz dist/
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image:
+          - ubuntu:24.04
+          - debian:13
+          - registry.fedoraproject.org/fedora:latest
+          - registry.opensuse.org/opensuse/tumbleweed:latest
+          - archlinux:latest
+        exclude:
+          - arch: aarch64  # Arch Linux publishes x86_64 images only.
+            image: archlinux:latest
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist
+      - run: packaging/ci-install.sh dist
+      - run: packaging/smoke-test.sh
+
+  release:
+    needs: smoke
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: AUR PKGBUILD and checksums
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          sum() { sha256sum "dist/bishop-$version-$1-linux.tar.gz" | cut -d' ' -f1; }
+          sed -e "s/@VERSION@/$version/" -e "s/@SHA256_X86_64@/$(sum x86_64)/" -e "s/@SHA256_AARCH64@/$(sum aarch64)/" \
+            packaging/aur/PKGBUILD.in > dist/PKGBUILD
+          (cd dist && sha256sum * > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --title "Bishop ${GITHUB_REF_NAME#v}" --generate-notes

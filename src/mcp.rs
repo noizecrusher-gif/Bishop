@@ -58,8 +58,11 @@ pub struct Server {
     path: PathBuf,
     tx: async_channel::Sender<ToolRequest>,
     disconnected: Arc<AtomicBool>,
-    connections: Arc<Mutex<Vec<UnixStream>>>,
+    connections: Connections,
 }
+
+/// Open connections by id, so Hard Stop can cut them off.
+type Connections = Arc<Mutex<Vec<(u64, UnixStream)>>>;
 
 impl Server {
     /// Refuses all further requests, closes every open connection, and removes the socket so
@@ -68,7 +71,7 @@ impl Server {
         self.disconnected.store(true, Ordering::SeqCst);
         self.tx.close();
         if let Ok(connections) = self.connections.lock() {
-            for conn in connections.iter() {
+            for (_, conn) in connections.iter() {
                 let _ = conn.shutdown(Shutdown::Both);
             }
         }
@@ -90,15 +93,20 @@ pub fn serve(path: &Path, tx: async_channel::Sender<ToolRequest>) -> std::io::Re
     };
     let (disconnected, connections) = (server.disconnected.clone(), server.connections.clone());
     std::thread::spawn(move || {
-        for conn in listener.incoming().flatten() {
+        for (id, conn) in (0u64..).zip(listener.incoming().flatten()) {
             if disconnected.load(Ordering::SeqCst) {
                 break;
             }
             if let (Ok(clone), Ok(mut list)) = (conn.try_clone(), connections.lock()) {
-                list.push(clone);
+                list.push((id, clone));
             }
-            let (tx, disconnected) = (tx.clone(), disconnected.clone());
-            std::thread::spawn(move || handle_connection(conn, tx, disconnected));
+            let (tx, disconnected, connections) = (tx.clone(), disconnected.clone(), connections.clone());
+            std::thread::spawn(move || {
+                handle_connection(conn, tx, disconnected);
+                if let Ok(mut list) = connections.lock() {
+                    list.retain(|(other, _)| *other != id);
+                }
+            });
         }
     });
     Ok(server)
@@ -107,6 +115,7 @@ pub fn serve(path: &Path, tx: async_channel::Sender<ToolRequest>) -> std::io::Re
 fn handle_connection(conn: UnixStream, tx: async_channel::Sender<ToolRequest>, disconnected: Arc<AtomicBool>) {
     let Ok(out) = conn.try_clone() else { return };
     let out = Arc::new(Mutex::new(out));
+    let mut requests = Vec::new();
     for line in BufReader::new(conn).lines() {
         let Ok(line) = line else { break };
         if disconnected.load(Ordering::SeqCst) {
@@ -117,13 +126,21 @@ fn handle_connection(conn: UnixStream, tx: async_channel::Sender<ToolRequest>, d
         }
         // One thread per request: a send_keys awaiting approval must not block reads.
         let (tx, out) = (tx.clone(), out.clone());
-        std::thread::spawn(move || {
+        requests.retain(|request: &std::thread::JoinHandle<()>| !request.is_finished());
+        requests.push(std::thread::spawn(move || {
             if let Some(response) = handle_message(&line, &tx)
                 && let Ok(mut out) = out.lock()
             {
                 let _ = writeln!(out, "{response}");
             }
-        });
+        }));
+    }
+    // The client is done sending: answer what it already asked, then hang up.
+    for request in requests {
+        let _ = request.join();
+    }
+    if let Ok(out) = out.lock() {
+        let _ = out.shutdown(Shutdown::Both);
     }
 }
 

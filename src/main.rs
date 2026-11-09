@@ -16,6 +16,11 @@ pub const APP_ID: &str = "io.github.noizecrusher_gif.Bishop";
 fn main() -> glib::ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
+        println!("bishop {}", env!("CARGO_PKG_VERSION"));
+        return glib::ExitCode::SUCCESS;
+    }
+
     // Claude Code launches this binary as its MCP server: `bishop mcp-bridge <socket>`.
     if args.get(1).map(String::as_str) == Some("mcp-bridge") {
         return match args.get(2) {

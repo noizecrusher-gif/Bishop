@@ -40,14 +40,21 @@ The agent needs [Claude Code](https://claude.com/claude-code) installed and sign
 
 ## Install
 
-On Ubuntu, Debian and their derivatives, download the `.deb` from the
-[releases page](https://github.com/noizecrusher-gif/Bishop/releases), then:
+Download the package for your system from the
+[releases page](https://github.com/noizecrusher-gif/Bishop/releases). Each release has x86_64 and
+aarch64 (ARM) builds.
 
-```sh
-sudo apt install ./bishop_0.10.0-1_amd64.deb
-```
+| System | Package | Install with |
+|---|---|---|
+| Ubuntu, Debian, Mint, Pop!_OS, Zorin, elementary | `bishop_<version>-1_amd64.deb` (`_arm64.deb` on ARM) | `sudo apt install ./bishop_*.deb` |
+| Fedora | `bishop-<version>-1.x86_64.rpm` | `sudo dnf install ./bishop-*.rpm` |
+| openSUSE Tumbleweed | `bishop-<version>-1.x86_64.rpm` | `sudo zypper install --allow-unsigned-rpm ./bishop-*.rpm` |
+| Arch, Manjaro, EndeavourOS, CachyOS | `PKGBUILD` (AUR: `bishop-bin`) | `makepkg -si` in a folder with the `PKGBUILD` |
+| Anything else | `bishop-<version>-<arch>-linux.tar.gz` | extract it, then `./install.sh` (yourself) or `sudo ./install.sh` (everyone) |
 
-Packages for other distributions are coming; until then, build from source.
+Every package is tested on its distribution before a release is published: it is installed in a
+fresh container, started, and made to run a command through the agent connection. Each release
+also lists the packages' SHA-256 checksums in `SHA256SUMS`.
 
 ## Build from source
 

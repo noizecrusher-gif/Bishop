@@ -50,3 +50,27 @@ assets = [
     ["data/icons/hicolor/256x256/apps/io.github.noizecrusher_gif.Bishop.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["data/icons/hicolor/512x512/apps/io.github.noizecrusher_gif.Bishop.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
 ]
+
+# `cargo generate-rpm` (after `cargo build --release`): one package for Fedora and openSUSE. It
+# depends on library sonames rather than package names, which differ between the two.
+[package.metadata.generate-rpm]
+summary = "Terminal with a built-in AI assistant"
+release = "1"
+auto-req = "no"
+assets = [
+    { source = "target/release/bishop", dest = "/usr/bin/bishop", mode = "755" },
+    { source = "data/io.github.noizecrusher_gif.Bishop.desktop", dest = "/usr/share/applications/io.github.noizecrusher_gif.Bishop.desktop", mode = "644" },
+    { source = "data/io.github.noizecrusher_gif.Bishop.metainfo.xml", dest = "/usr/share/metainfo/io.github.noizecrusher_gif.Bishop.metainfo.xml", mode = "644" },
+    { source = "data/icons/hicolor/*/apps/io.github.noizecrusher_gif.Bishop.png", dest = "/usr/share/icons/hicolor/", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/bishop/LICENSE", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/bishop/README.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+"libgtk-4.so.1()(64bit)" = "*"
+"libadwaita-1.so.0()(64bit)" = "*"
+"libvte-2.91-gtk4.so.0()(64bit)" = "*"
+"libc.so.6(GLIBC_2.34)(64bit)" = "*"
+
+[package.metadata.generate-rpm.recommends]
+polkit = "*"
