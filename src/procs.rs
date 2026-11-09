@@ -35,10 +35,13 @@ pub fn cgroup(pid: i32) -> Option<String> {
     text.lines().find_map(|line| line.strip_prefix("0::")).map(str::to_owned)
 }
 
-/// Every process in the same cgroup as `pid`, except `pid` itself. Falls back to the
-/// session if cgroups aren't available.
+/// Every process in the same cgroup as `pid`, except `pid` itself, when that cgroup is a
+/// scope of its own (VTE starts each shell in a `vte-spawn-*.scope` under systemd). Otherwise
+/// (no systemd, or the scope couldn't be made, leaving the shell in Bishop's own cgroup or the
+/// root one) the cgroup holds unrelated processes, so fall back to the shell's session.
 pub fn alongside(pid: i32) -> Vec<Process> {
-    let scope = cgroup(pid);
+    let own = cgroup(std::process::id() as i32);
+    let scope = cgroup(pid).filter(|scope| is_private_scope(scope, own.as_deref()));
     all()
         .into_iter()
         .filter(|p| p.pid != pid)
@@ -47,6 +50,11 @@ pub fn alongside(pid: i32) -> Vec<Process> {
             None => p.session == pid,
         })
         .collect()
+}
+
+fn is_private_scope(scope: &str, bishop: Option<&str>) -> bool {
+    let name = scope.rsplit('/').next().unwrap_or_default();
+    name.starts_with("vte-spawn-") && name.ends_with(".scope") && Some(scope) != bishop
 }
 
 fn read(pid: i32) -> Option<Process> {
@@ -105,6 +113,17 @@ mod tests {
         let stat = "4321 (my (odd) prog) S 100 4321 99 34816 4321 4194560 0 0 0 0 1 2 0 0 20 0 1 0 987654 1000 200";
         assert_eq!(parse_stat(stat), Some(('S', 4321, 99, 987654)));
         assert_eq!(comm(stat).as_deref(), Some("my (odd) prog"));
+    }
+
+    #[test]
+    fn trusts_only_per_terminal_scopes() {
+        let vte = "/user.slice/user-1000.slice/user@1000.service/app.slice/vte-spawn-1f2e.scope";
+        let app = "/user.slice/user-1000.slice/user@1000.service/app.slice/app-bishop-42.scope";
+        assert!(is_private_scope(vte, Some(app)));
+        assert!(!is_private_scope("/", Some("/")));
+        assert!(!is_private_scope(app, Some(app)));
+        assert!(!is_private_scope(vte, Some(vte)));
+        assert!(!is_private_scope("/user.slice/session-2.scope", None));
     }
 
     #[test]

@@ -49,15 +49,18 @@ fn appearance_page(dialog: &adw::PreferencesDialog, current: &settings::Settings
     custom.add_row(&suffix_row("Selected Text", &buttons.selection_text));
     custom.add_row(&palette_row("Normal Colors", &buttons.palette[..8], ""));
     custom.add_row(&palette_row("Bright Colors", &buttons.palette[8..], "Bright "));
-    let reset = adw::ButtonRow::builder().title("Reset to Theme Colors").build();
-    reset.connect_activated(glib::clone!(
-        #[strong]
-        controls,
-        move |_| {
-            settings::update(|s| s.appearance.reset_custom_colors());
-            controls.show_current();
-        }
-    ));
+    let reset = crate::compat::button_row(
+        "Reset to Theme Colors",
+        None,
+        glib::clone!(
+            #[strong]
+            controls,
+            move || {
+                settings::update(|s| s.appearance.reset_custom_colors());
+                controls.show_current();
+            }
+        ),
+    );
     custom.add_row(&reset);
     theme_group.add(custom);
     page.add(&theme_group);
@@ -121,9 +124,25 @@ fn behavior_page(current: &settings::Settings) -> adw::PreferencesPage {
     terminal.add(&bell);
     page.add(&terminal);
 
+    let tabs = adw::PreferencesGroup::builder().title("Tabs").build();
+    let limit = adw::SpinRow::with_range(1.0, settings::MAX_TAB_SCROLL_LIMIT as f64, 1.0);
+    limit.set_title("Tab Scroll Limit");
+    limit.set_subtitle(&format!(
+        "Tabs past this many scroll with the ‹ › buttons. Tabs share the bar's width, but never get \
+         narrower than the bar divided by this number. Up to {}.",
+        settings::MAX_TAB_SCROLL_LIMIT
+    ));
+    limit.set_value(behavior.tab_scroll_limit.clamp(1, settings::MAX_TAB_SCROLL_LIMIT) as f64);
+    limit.connect_value_notify(|row| {
+        let limit = row.value() as u32;
+        settings::update(|s| s.behavior.tab_scroll_limit = limit);
+    });
+    tabs.add(&limit);
+    page.add(&tabs);
+
     let shell = adw::PreferencesGroup::builder()
         .title("Shell")
-        .description("Applies to new windows. Leave empty to use your login shell ($SHELL).")
+        .description("Applies to new tabs. Leave empty to use your login shell ($SHELL).")
         .build();
     let shell_row = adw::EntryRow::builder()
         .title("Shell Command")
@@ -140,7 +159,7 @@ fn behavior_page(current: &settings::Settings) -> adw::PreferencesPage {
     page
 }
 
-/// `restart` restarts the agent panel of the window the dialog was opened from.
+/// `restart` restarts the agent panel of the tab the dialog was opened from.
 pub fn show_agent_config(parent: &impl IsA<gtk::Widget>, restart: impl Fn() + 'static) {
     let agent = settings::get().agent;
     let dialog = adw::PreferencesDialog::builder().title("Agent Configuration").build();
@@ -244,11 +263,8 @@ pub fn show_agent_config(parent: &impl IsA<gtk::Widget>, restart: impl Fn() + 's
     page.add(&privacy);
 
     let actions = adw::PreferencesGroup::new();
-    let restart_row = adw::ButtonRow::builder()
-        .title("Restart Agent in This Window")
-        .start_icon_name("view-refresh-symbolic")
-        .build();
-    restart_row.connect_activated(move |_| restart());
+    let restart_row =
+        crate::compat::button_row("Restart Agent in This Tab", Some("view-refresh-symbolic"), restart);
     actions.add(&restart_row);
     page.add(&actions);
 

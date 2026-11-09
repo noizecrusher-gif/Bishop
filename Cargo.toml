@@ -2,6 +2,8 @@
 name = "bishop"
 version = "0.10.0"
 edition = "2024"
+# let-chains (`if let … && let …`) need 1.88.
+rust-version = "1.88"
 description = "A Linux terminal with a built-in AI assistant that sees what you see and types where you type"
 homepage = "https://github.com/noizecrusher-gif/Bishop"
 repository = "https://github.com/noizecrusher-gif/Bishop"
@@ -9,15 +11,15 @@ readme = "README.md"
 license = "MIT"
 
 [dependencies]
-adw = { version = "0.9.2", package = "libadwaita", features = ["v1_9"] }
+adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"] }
 async-channel = "2.5.0"
-gtk = { version = "0.11", package = "gtk4", features = ["v4_22"] }
+gtk = { version = "0.11", package = "gtk4", features = ["v4_14"] }
 libc = "0.2.191"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.2.1"
-vte4 = { version = "0.10.0", features = ["v0_84"] }
+vte4 = { version = "0.10.0", features = ["v0_76"] }
 
 [profile.release]
 lto = true
@@ -38,6 +40,7 @@ recommends = "pkexec"
 assets = [
     ["target/release/bishop", "usr/bin/", "755"],
     ["data/io.github.noizecrusher_gif.Bishop.desktop", "usr/share/applications/", "644"],
+    ["data/io.github.noizecrusher_gif.Bishop.metainfo.xml", "usr/share/metainfo/", "644"],
     ["data/icons/hicolor/16x16/apps/io.github.noizecrusher_gif.Bishop.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
     ["data/icons/hicolor/24x24/apps/io.github.noizecrusher_gif.Bishop.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
     ["data/icons/hicolor/32x32/apps/io.github.noizecrusher_gif.Bishop.png", "usr/share/icons/hicolor/32x32/apps/", "644"],

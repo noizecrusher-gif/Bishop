@@ -5,7 +5,7 @@
 //! terminal, escalating to SIGKILL. Processes Bishop isn't allowed to kill are reported
 //! with a way to finish the job, never silently left behind.
 //!
-//! Hard Stop also kills Claude Code and disconnects it from the window for good.
+//! Hard Stop also kills Claude Code and disconnects it from the tab for good.
 
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
@@ -15,7 +15,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use vte4::prelude::*;
 
-use super::Bishop;
+use super::Session;
 use crate::procs::{self, Process};
 
 /// How long each escalation step gets before the next one.
@@ -28,7 +28,7 @@ const REMOTE_GRACE: Duration = Duration::from_millis(2000);
 /// Foreground programs that relay keystrokes to another machine.
 const REMOTE_CLIENTS: &[&str] = &["ssh", "mosh-client", "mosh", "telnet", "et"];
 
-impl Bishop {
+impl Session {
     /// The Emergency Stop button. Three clicks within `HARD_STOP_CLICKS` also Hard Stop.
     pub(super) fn stop_clicked(self: &Rc<Self>) {
         let now = Instant::now();
@@ -60,6 +60,7 @@ impl Bishop {
             self.auto_switch.set_active(false);
         }
         self.stopped_banner.set_revealed(true);
+        self.chrome_changed();
         if first {
             // Escape interrupts Claude Code's current turn. Only once: a second Escape opens its
             // rewind menu.
@@ -80,7 +81,7 @@ impl Bishop {
         }
     }
 
-    /// Kills Claude Code and disconnects it from this window until it is closed.
+    /// Kills Claude Code and disconnects it from this tab until it is closed.
     pub(super) fn hard_stop(self: &Rc<Self>) {
         if self.hard_stopped.replace(true) {
             return;
@@ -97,14 +98,12 @@ impl Bishop {
                 libc::kill(pid.0, libc::SIGKILL);
             }
         }
-        self.agent_button.set_sensitive(false);
-        self.agent_button.set_tooltip_text(Some("Disconnected by Hard Stop. Open a new window to use the agent."));
         self.stopped_banner.set_title(
-            "Hard stop: the agent is disconnected from this terminal. Open a new window to use it again.",
+            "Hard stop: the agent is disconnected from this terminal. Open a new tab to use it again.",
         );
         self.stopped_banner.set_button_label(None);
         self.stopped_banner.set_revealed(true);
-        self.update_stop_buttons();
+        self.update_floating_stop();
         self.audit("hard_stop", "", "agent killed and disconnected", None);
         self.toast("Hard stop: Claude Code was killed and disconnected from this terminal");
     }
@@ -115,6 +114,7 @@ impl Bishop {
         }
         self.stopped.set(false);
         self.stopped_banner.set_revealed(false);
+        self.chrome_changed();
         self.audit("resume", "", "resumed by user", None);
         self.toast("Agent resumed. Automatic mode is off, so Claude asks before typing.");
     }
@@ -270,17 +270,25 @@ impl Bishop {
         };
         self.audit("emergency_stop", &list, "processes survived", None);
 
+        let pids: Vec<i32> = survivors.iter().map(|p| p.pid).collect();
+        // Without pkexec (polkit), say how to do it by hand instead.
+        let pkexec = glib::find_program_in_path("pkexec").is_some();
+        let manual = if foreign && !pkexec {
+            let list: Vec<String> = pids.iter().map(i32::to_string).collect();
+            format!("\n\nTo stop them, run this in another terminal:\nsudo kill -KILL {}", list.join(" "))
+        } else {
+            String::new()
+        };
         let dialog = adw::AlertDialog::builder()
             .heading("The command is still running")
-            .body(format!("The agent is stopped, but these processes are still running:{list}\n\n{reason}"))
+            .body(format!("The agent is stopped, but these processes are still running:{list}\n\n{reason}{manual}"))
             .build();
         dialog.add_response("close", "Close");
-        if foreign {
+        if foreign && pkexec {
             dialog.add_response("force", "Force Stop as Administrator");
             dialog.set_response_appearance("force", adw::ResponseAppearance::Destructive);
             dialog.set_default_response(Some("force"));
         }
-        let pids: Vec<i32> = survivors.iter().map(|p| p.pid).collect();
         let state = Rc::downgrade(self);
         dialog.connect_response(Some("force"), move |_, _| {
             if let Some(state) = state.upgrade() {

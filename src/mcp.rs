@@ -1,4 +1,4 @@
-//! Minimal MCP server (newline-delimited JSON-RPC) on a per-window unix socket.
+//! Minimal MCP server (newline-delimited JSON-RPC) on a per-tab unix socket.
 //!
 //! Socket threads never touch GTK: tool calls are forwarded to the window's main-thread
 //! handler as `ToolRequest`s and the answer comes back over a std channel.
@@ -40,7 +40,7 @@ pub fn runtime_dir() -> PathBuf {
     dir
 }
 
-/// Files are named `<pid>-<window>.*`; drop those left behind by processes that died
+/// Files are named `<pid>-<window>-<tab>.*`; drop those left behind by processes that died
 /// without closing their windows.
 fn remove_stale_files(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else { return };
@@ -168,7 +168,7 @@ fn call_tool(params: &Value, tx: &async_channel::Sender<ToolRequest>) -> Value {
         reply,
     };
     let outcome = if tx.send_blocking(request).is_err() {
-        Err("the Bishop window for this session is closed".to_owned())
+        Err("the Bishop tab for this session is closed".to_owned())
     } else {
         rx.recv_timeout(TOOL_TIMEOUT)
             .unwrap_or_else(|_| Err("timed out waiting for the terminal".to_owned()))

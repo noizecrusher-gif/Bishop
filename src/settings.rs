@@ -147,11 +147,16 @@ pub struct Behavior {
     pub audible_bell: bool,
     /// Empty means `$SHELL`.
     pub shell: String,
+    /// How many tabs fit in the tab bar before it scrolls; also the narrowest a tab gets
+    /// (the bar's width divided by this). 1 to `MAX_TAB_SCROLL_LIMIT`.
+    pub tab_scroll_limit: u32,
 }
+
+pub const MAX_TAB_SCROLL_LIMIT: u32 = 20;
 
 impl Default for Behavior {
     fn default() -> Self {
-        Self { scrollback_lines: 10_000, audible_bell: false, shell: String::new() }
+        Self { scrollback_lines: 10_000, audible_bell: false, shell: String::new(), tab_scroll_limit: 8 }
     }
 }
 

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.noizecrusher_gif.Bishop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Bishop</name>
+  <summary>Terminal with a built-in AI assistant</summary>
+  <description>
+    <p>
+      Bishop is a terminal emulator with Claude Code built into a side panel. The assistant sees
+      what is in your terminal and types into it the way you would, including over SSH, so it works
+      with your own session and access instead of needing its own.
+    </p>
+    <ul>
+      <li>Tabs, each with its own terminal session and assistant</li>
+      <li>Approvals before the assistant types, or an automatic mode</li>
+      <li>Warnings for destructive commands, and a guard that never types at password prompts</li>
+      <li>An Emergency Stop that halts the assistant and terminates what it started</li>
+      <li>An activity log of everything the assistant typed</li>
+      <li>Themes, a full color palette editor, background opacity and zoom</li>
+    </ul>
+    <p>The assistant requires Claude Code, installed separately.</p>
+  </description>
+  <launchable type="desktop-id">io.github.noizecrusher_gif.Bishop.desktop</launchable>
+  <url type="homepage">https://github.com/noizecrusher-gif/Bishop</url>
+  <url type="bugtracker">https://github.com/noizecrusher-gif/Bishop/issues</url>
+  <developer id="io.github.noizecrusher_gif">
+    <name>noizecrusher-gif</name>
+  </developer>
+  <provides>
+    <binary>bishop</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.10.0" date="2026-11-06"/>
+  </releases>
+</component>

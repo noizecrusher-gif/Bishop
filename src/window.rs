@@ -1,9 +1,14 @@
+//! A Bishop window: the header bar, the tab bar, and one `Session` per tab. Each session is
+//! a terminal with its own agent panel, Claude Code process, and MCP socket; all agents run
+//! in the same workspace, so they share CLAUDE.md, personal instructions, and memory.
+
 mod agent;
 mod stop;
+mod tabs;
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -15,6 +20,7 @@ use vte4::prelude::*;
 use crate::mcp::{self, ToolRequest};
 use crate::prefs;
 use crate::settings::{self, Settings};
+use crate::shell;
 
 const MIN_ZOOM: f64 = 0.5;
 const MAX_ZOOM: f64 = 3.0;
@@ -23,9 +29,11 @@ const BANNER_HOLD: Duration = Duration::from_millis(1500);
 /// In full screen, the header bar slides in when the pointer is this close to the top edge
 /// and hides again once it moves below `REVEAL_HIDE_Y`.
 const REVEAL_SHOW_Y: f64 = 2.0;
-const REVEAL_HIDE_Y: f64 = 64.0;
+const REVEAL_HIDE_Y: f64 = 96.0;
 /// Three Emergency Stop clicks within this window make a Hard Stop.
 const HARD_STOP_CLICKS: Duration = Duration::from_millis(1500);
+/// After a tab closes, Claude Code gets this long to exit on SIGHUP before it is killed.
+const AGENT_EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Claude Code never prompts for Bishop's tools: Bishop gates `send_keys` itself, so
 /// automatic mode can be switched while Claude is running.
@@ -33,19 +41,43 @@ const ALLOWED_TOOLS: &str = "mcp__bishop__*";
 
 const AGENT_PROMPT: &str = "You are the assistant built into Bishop, a Linux terminal emulator. \
 When the user mentions their terminal, screen, shell, or session, they mean the Bishop terminal \
-session you reach through the `bishop` MCP tools. Follow the Bishop agent guide in CLAUDE.md.";
+session you reach through the `bishop` MCP tools: the terminal in your own Bishop tab. Follow the \
+Bishop agent guide in CLAUDE.md.";
 
 /// Written to the agent workspace as CLAUDE.md so Claude Code loads it as memory.
 const AGENT_GUIDE: &str = include_str!("agent_guide.md");
 
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
 
-struct Bishop {
+/// One window: the header bar and tab bar act on whichever tab is showing.
+struct Host {
     window: adw::ApplicationWindow,
+    title: adw::WindowTitle,
+    agent_button: gtk::ToggleButton,
+    stop_button: gtk::Button,
+    zoom_label: gtk::Label,
+    toolbar: adw::ToolbarView,
+    stack: gtk::Stack,
+    tab_bar: Rc<tabs::TabBar>,
+    sessions: RefCell<Vec<Rc<Session>>>,
+    zoom: Cell<f64>,
+    /// Set while the header controls are updated to match the current tab.
+    syncing: Cell<bool>,
+    id: String,
+    next_tab: Cell<u32>,
+}
+
+/// One tab: a terminal, its agent panel, and everything the agent needs to drive it.
+struct Session {
+    host: Weak<Host>,
+    window: adw::ApplicationWindow,
+    /// The tab's content in the window's stack.
+    page: gtk::Widget,
+    tab: tabs::Tab,
+    title: RefCell<String>,
     terminal: vte4::Terminal,
     agent_terminal: vte4::Terminal,
     agent_pane: gtk::Box,
-    agent_button: gtk::ToggleButton,
     agent_running: Cell<bool>,
     agent_pid: Cell<Option<glib::Pid>>,
     restart_agent: Cell<bool>,
@@ -55,6 +87,9 @@ struct Bishop {
     quiet_auto_toggle: Cell<bool>,
     approval: ApprovalBar,
     pending_approval: RefCell<Option<async_channel::Sender<bool>>>,
+    /// The full input and warning of the pending approval, for See More.
+    approval_details: RefCell<Option<(String, Option<String>)>>,
+    approval_dialog: RefCell<Option<adw::Window>>,
     /// In-flight agent operations (typing, or waiting on a command).
     agent_busy: Cell<u32>,
     last_agent_input: Cell<Option<Instant>>,
@@ -64,12 +99,15 @@ struct Bishop {
     /// The shell has sent VTE shell-integration events (preexec/precmd).
     integration_seen: Cell<bool>,
     shell_waiters: RefCell<Vec<async_channel::Sender<agent::ShellEvent>>>,
+    /// Where the shell's integration hook reports finished commands.
+    shell_events: RefCell<Option<shell::Events>>,
     last_output: Cell<Instant>,
-    /// The agent has started in this window at least once; Emergency Stop shows from then on.
+    /// The agent has started in this tab at least once; Emergency Stop shows from then on.
     agent_started: Cell<bool>,
     /// Emergency Stop pressed: all agent input is refused until the user resumes.
     stopped: Cell<bool>,
-    /// Hard Stop pressed: Claude Code is killed and disconnected for the life of the window.
+    /// Hard Stop pressed (or the tab closed): Claude Code is killed and disconnected for the
+    /// life of the tab.
     hard_stopped: Cell<bool>,
     /// An Emergency Stop is currently terminating the running command.
     terminating: Cell<bool>,
@@ -79,7 +117,6 @@ struct Bishop {
     /// them are the agent's, and Emergency Stop kills them even if they run in the background.
     agent_driving_since: Cell<Option<u64>>,
     agent_driving_spans: RefCell<Vec<(u64, u64)>>,
-    stop_button: gtk::Button,
     floating_stop_button: gtk::Button,
     stopped_banner: adw::Banner,
     mcp_server: RefCell<Option<mcp::Server>>,
@@ -87,10 +124,8 @@ struct Bishop {
     paned_positioned: Cell<bool>,
     banner: adw::Banner,
     banner_generation: Cell<u64>,
-    zoom_label: gtk::Label,
     toasts: adw::ToastOverlay,
-    toolbar: adw::ToolbarView,
-    window_id: String,
+    session_id: String,
     socket_path: PathBuf,
     mcp_config: PathBuf,
 }
@@ -100,6 +135,8 @@ struct ApprovalBar {
     revealer: gtk::Revealer,
     label: gtk::Label,
     warning: gtk::Label,
+    /// Shown when the input or warning is too long for the bar.
+    more: gtk::Button,
     approve: gtk::Button,
     deny: gtk::Button,
 }
@@ -111,47 +148,6 @@ pub fn new(app: &adw::Application) -> adw::ApplicationWindow {
         .default_width(1100)
         .default_height(700)
         .build();
-
-    let terminal = new_terminal();
-    let agent_terminal = new_terminal();
-    let terminal_pane = scrolled(&terminal);
-    let auto_switch = gtk::Switch::builder()
-        .valign(gtk::Align::Center)
-        .tooltip_text("When on, Claude types into your terminal without asking first")
-        .build();
-    let agent_pane = agent_pane(&agent_terminal, &auto_switch);
-
-    let banner = adw::Banner::new("Claude is typing in this terminal");
-    let approval = approval_bar();
-    let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let stopped_banner = adw::Banner::builder()
-        .title("Emergency stop: the agent can't type until you resume it")
-        .button_label("Resume Agent")
-        .build();
-    main_box.append(&stopped_banner);
-    main_box.append(&banner);
-    main_box.append(&approval.revealer);
-    main_box.append(&terminal_pane);
-
-    let paned = gtk::Paned::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .start_child(&main_box)
-        .end_child(&agent_pane)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
-        .wide_handle(true)
-        .build();
-    let stop_button = emergency_stop_button();
-    let floating_stop_button = emergency_stop_button();
-    floating_stop_button.set_halign(gtk::Align::End);
-    floating_stop_button.set_valign(gtk::Align::Start);
-    floating_stop_button.set_margin_top(12);
-    floating_stop_button.set_margin_end(12);
-    let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&paned));
-    overlay.add_overlay(&floating_stop_button);
-    let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&overlay));
 
     let title = adw::WindowTitle::new("Bishop", "");
     let header = adw::HeaderBar::builder()
@@ -169,194 +165,73 @@ pub fn new(app: &adw::Application) -> adw::ApplicationWindow {
         .build();
     let agent_button = gtk::ToggleButton::builder()
         .label("Agent")
-        .tooltip_text("Show the Claude Code panel")
+        .tooltip_text("Show this tab's Claude Code panel")
         .build();
+    let stop_button = emergency_stop_button();
     header.pack_end(&menu_button);
     header.pack_end(&agent_button);
     header.pack_start(&stop_button);
 
+    let current = settings::get();
+    let tab_bar = tabs::TabBar::new(current.behavior.tab_scroll_limit);
+    let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&toasts));
+    toolbar.add_top_bar(&tab_bar.widget);
+    toolbar.set_content(Some(&stack));
     window.set_content(Some(&toolbar));
 
-    let current = settings::get();
-    auto_switch.set_active(current.agent.automatic_mode);
-
-    let id = format!("{}-{}", std::process::id(), NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed));
-    let dir = mcp::runtime_dir();
-    let state = Rc::new(Bishop {
+    let host = Rc::new(Host {
         window: window.clone(),
-        terminal: terminal.clone(),
-        agent_terminal: agent_terminal.clone(),
-        agent_pane,
+        title,
         agent_button: agent_button.clone(),
-        agent_running: Cell::new(false),
-        agent_pid: Cell::new(None),
-        restart_agent: Cell::new(false),
-        auto_switch: auto_switch.clone(),
-        auto_mode: Cell::new(current.agent.automatic_mode),
-        quiet_auto_toggle: Cell::new(false),
-        approval,
-        pending_approval: RefCell::new(None),
-        agent_busy: Cell::new(0),
-        last_agent_input: Cell::new(None),
-        cancel_generation: Cell::new(0),
-        shell_pid: Cell::new(None),
-        integration_seen: Cell::new(false),
-        shell_waiters: RefCell::new(Vec::new()),
-        last_output: Cell::new(Instant::now()),
-        agent_started: Cell::new(false),
-        stopped: Cell::new(false),
-        hard_stopped: Cell::new(false),
-        terminating: Cell::new(false),
-        stop_clicks: RefCell::new(Vec::new()),
-        agent_driving_since: Cell::new(None),
-        agent_driving_spans: RefCell::new(Vec::new()),
         stop_button: stop_button.clone(),
-        floating_stop_button: floating_stop_button.clone(),
-        stopped_banner: stopped_banner.clone(),
-        mcp_server: RefCell::new(None),
-        paned,
-        paned_positioned: Cell::new(false),
-        banner,
-        banner_generation: Cell::new(0),
         zoom_label,
-        toasts,
         toolbar: toolbar.clone(),
-        socket_path: dir.join(format!("{id}.sock")),
-        mcp_config: dir.join(format!("{id}.mcp.json")),
-        window_id: id,
+        stack,
+        tab_bar: tab_bar.clone(),
+        sessions: RefCell::new(Vec::new()),
+        zoom: Cell::new(1.0),
+        syncing: Cell::new(false),
+        id: format!("{}-{}", std::process::id(), NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed)),
+        next_tab: Cell::new(1),
     });
+    host.add_actions();
 
-    state.add_actions();
-    state.start_mcp_server();
-    state.apply_settings(&current);
-    let weak = Rc::downgrade(&state);
-    settings::subscribe(move |settings| {
-        weak.upgrade().inspect(|state| state.apply_settings(settings)).is_some()
-    });
-
-    let shell = Some(current.behavior.shell)
-        .filter(|shell| !shell.is_empty())
-        .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/bash".into());
-    let argv = shell_words(&shell);
-    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let weak = Rc::downgrade(&state);
-    spawn(&terminal, &argv, &glib::home_dir(), move |pid| {
-        if let Some(state) = weak.upgrade() {
-            state.shell_pid.set(Some(pid));
-        }
-    });
-    for prop in ["vte.shell.preexec", "vte.shell.precmd"] {
-        terminal.connect_termprop_changed(
-            Some(prop),
-            glib::clone!(
-                #[weak]
-                state,
-                move |_, prop| state.shell_event(prop)
-            ),
-        );
-    }
-    terminal.connect_contents_changed(glib::clone!(
-        #[weak]
-        state,
-        move |_| state.last_output.set(Instant::now())
-    ));
-    // Any real keypress in the terminal while Claude is working hands control back to the user.
-    let keys = gtk::EventControllerKey::new();
-    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-    keys.connect_key_pressed(glib::clone!(
-        #[weak]
-        state,
-        #[upgrade_or]
-        glib::Propagation::Proceed,
-        move |_, key, _, modifiers| {
-            let shortcut = modifiers.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
-            if !is_modifier(key) && !shortcut {
-                state.user_typed();
-                state.take_over();
-            }
-            glib::Propagation::Proceed
-        }
-    ));
-    terminal.add_controller(keys);
-    terminal.connect_child_exited(glib::clone!(
-        #[weak]
-        window,
-        move |_, _| window.close()
-    ));
-    terminal.connect_termprop_changed(
-        Some("xterm.title"),
-        glib::clone!(
-            #[weak]
-            window,
-            #[weak]
-            title,
-            move |term, _| {
-                let text = term.termprop_string("xterm.title").0.unwrap_or_default();
-                title.set_subtitle(&text);
-                window.set_title(Some(if text.is_empty() { "Bishop" } else { &text }));
-            }
-        ),
-    );
-
-    agent_terminal.connect_child_exited(glib::clone!(
-        #[weak]
-        state,
-        move |term, _| {
-            state.agent_running.set(false);
-            state.agent_pid.set(None);
-            if state.hard_stopped.get() {
-                term.feed(b"\r\n[Hard stop: the agent is disconnected. Open a new Bishop window to use it again.]\r\n");
-                return;
-            }
-            if state.restart_agent.replace(false) {
-                state.start_agent();
-                return;
-            }
-            term.feed(b"\r\n[Claude Code exited. Toggle the Agent panel to restart it.]\r\n");
-            state.agent_button.set_active(false);
-        }
-    ));
-    for button in [&stop_button, &floating_stop_button] {
-        button.connect_clicked(glib::clone!(
-            #[weak]
-            state,
-            move |_| state.stop_clicked()
-        ));
-    }
-    stopped_banner.connect_button_clicked(glib::clone!(
-        #[weak]
-        state,
-        move |_| state.resume_agent()
-    ));
-    auto_switch.connect_active_notify(glib::clone!(
-        #[weak]
-        state,
-        move |switch| state.set_auto_mode(switch.is_active())
-    ));
-    state.approval.approve.connect_clicked(glib::clone!(
-        #[weak]
-        state,
-        move |_| state.resolve_approval(true)
-    ));
-    state.approval.deny.connect_clicked(glib::clone!(
-        #[weak]
-        state,
-        move |_| state.resolve_approval(false)
-    ));
     agent_button.connect_toggled(glib::clone!(
         #[weak]
-        state,
-        move |button| state.set_agent_visible(button.is_active())
+        host,
+        move |button| {
+            if !host.syncing.get()
+                && let Some(session) = host.current()
+            {
+                session.set_agent_visible(button.is_active());
+            }
+        }
     ));
+    stop_button.connect_clicked(glib::clone!(
+        #[weak]
+        host,
+        move |_| {
+            if let Some(session) = host.current() {
+                session.stop_clicked();
+            }
+        }
+    ));
+    tab_bar.new_button.connect_clicked(glib::clone!(
+        #[weak]
+        host,
+        move |_| host.add_tab()
+    ));
+    let weak = Rc::downgrade(&host);
+    settings::subscribe(move |settings| {
+        weak.upgrade().inspect(|host| host.tab_bar.set_limit(settings.behavior.tab_scroll_limit)).is_some()
+    });
 
     window.connect_fullscreened_notify(glib::clone!(
         #[weak]
-        state,
-        move |window| state.fullscreen_changed(window.is_fullscreen())
+        host,
+        move |window| host.fullscreen_changed(window.is_fullscreen())
     ));
     let motion = gtk::EventControllerMotion::new();
     motion.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -377,24 +252,18 @@ pub fn new(app: &adw::Application) -> adw::ApplicationWindow {
         }
     ));
     window.add_controller(motion);
+
+    host.add_tab();
     // This handler owns the window state; every other closure holds a weak reference.
     window.connect_close_request(move |_| {
-        let _ = std::fs::remove_file(&state.socket_path);
-        let _ = std::fs::remove_file(&state.mcp_config);
+        host.close_all();
         glib::Propagation::Proceed
     });
-
-    terminal.grab_focus();
     window
 }
 
 fn new_terminal() -> vte4::Terminal {
     vte4::Terminal::builder().hexpand(true).vexpand(true).build()
-}
-
-/// Splits a shell setting like `/usr/bin/zsh -l` into argv on whitespace.
-fn shell_words(command: &str) -> Vec<String> {
-    command.split_whitespace().map(str::to_owned).collect()
 }
 
 fn scrolled(terminal: &vte4::Terminal) -> gtk::ScrolledWindow {
@@ -422,14 +291,17 @@ fn agent_pane(agent_terminal: &vte4::Terminal, auto_switch: &gtk::Switch) -> gtk
             .build(),
     );
     mode_row.append(auto_switch);
-    mode_row.add_css_class("solid");
+    // Solid including its margins and the separator, so no gap shows through when the
+    // background is translucent.
+    let header = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["solid"]).build();
+    header.append(&mode_row);
+    header.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     let pane = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .visible(false)
         .build();
-    pane.append(&mode_row);
-    pane.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    pane.append(&header);
     pane.append(&scrolled(agent_terminal));
     pane
 }
@@ -448,8 +320,17 @@ fn approval_bar() -> ApprovalBar {
     let warning = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .lines(2)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .visible(false)
         .css_classes(["error", "heading"])
+        .build();
+    let more = gtk::Button::builder()
+        .label("See More")
+        .tooltip_text("Review the whole input in a separate window")
+        .valign(gtk::Align::Center)
+        .visible(false)
         .build();
     let deny = gtk::Button::builder().label("Deny").valign(gtk::Align::Center).build();
     let approve = gtk::Button::builder()
@@ -464,6 +345,7 @@ fn approval_bar() -> ApprovalBar {
         .build();
     row.append(&gtk::Label::builder().label("Claude wants to type:").css_classes(["heading"]).build());
     row.append(&label);
+    row.append(&more);
     row.append(&deny);
     row.append(&approve);
 
@@ -482,7 +364,7 @@ fn approval_bar() -> ApprovalBar {
     frame.append(&content);
     frame.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let revealer = gtk::Revealer::builder().child(&frame).build();
-    ApprovalBar { revealer, label, warning, approve, deny }
+    ApprovalBar { revealer, label, warning, more, approve, deny }
 }
 
 fn emergency_stop_button() -> gtk::Button {
@@ -494,8 +376,8 @@ fn emergency_stop_button() -> gtk::Button {
                 .build(),
         )
         .tooltip_text(
-            "Stop the agent and terminate the command it's running (Ctrl+Shift+Esc).\n\
-             Click three times quickly for a Hard Stop, which disconnects the agent from this window.",
+            "Stop this tab's agent and terminate the command it's running (Ctrl+Shift+Esc).\n\
+             Click three times quickly for a Hard Stop, which disconnects the agent from this tab.",
         )
         .css_classes(["destructive-action"])
         .visible(false)
@@ -511,9 +393,17 @@ fn is_modifier(key: gdk::Key) -> bool {
     .contains(&key)
 }
 
+/// Window shortcuts that pass through the terminal's key handler; they aren't typing.
+fn is_shortcut(key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
+    use gdk::{Key, ModifierType};
+    modifiers.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK)
+        || (modifiers.contains(ModifierType::CONTROL_MASK) && [Key::Page_Up, Key::Page_Down].contains(&key))
+}
+
 fn spawn(
     terminal: &vte4::Terminal,
     argv: &[&str],
+    env: &[&str],
     cwd: &Path,
     on_started: impl FnOnce(glib::Pid) + 'static,
 ) {
@@ -522,7 +412,7 @@ fn spawn(
         vte4::PtyFlags::DEFAULT,
         cwd.to_str(),
         argv,
-        &[],
+        env,
         glib::SpawnFlags::DEFAULT,
         || {},
         -1,
@@ -544,6 +434,7 @@ fn build_menu() -> gio::Menu {
     let menu = gio::Menu::new();
 
     let windows = gio::Menu::new();
+    windows.append(Some("New Tab"), Some("win.new-tab"));
     windows.append(Some("New Window"), Some("app.new-window"));
     windows.append(Some("Full Screen"), Some("win.fullscreen"));
     menu.append_section(None, &windows);
@@ -601,14 +492,25 @@ fn zoom_row(label: &gtk::Label) -> gtk::Box {
     row
 }
 
-impl Bishop {
+impl Host {
     fn add_actions(self: &Rc<Self>) {
-        let action = |name: &str, f: fn(&Rc<Bishop>)| {
-            let state = Rc::downgrade(self);
+        let action = |name: &str, f: fn(&Rc<Host>)| {
+            let host = Rc::downgrade(self);
             gio::ActionEntry::builder(name)
                 .activate(move |_: &adw::ApplicationWindow, _, _| {
-                    if let Some(state) = state.upgrade() {
-                        f(&state);
+                    if let Some(host) = host.upgrade() {
+                        f(&host);
+                    }
+                })
+                .build()
+        };
+        // Actions on the tab that's showing.
+        let on_tab = |name: &str, f: fn(&Rc<Session>)| {
+            let host = Rc::downgrade(self);
+            gio::ActionEntry::builder(name)
+                .activate(move |_: &adw::ApplicationWindow, _, _| {
+                    if let Some(session) = host.upgrade().and_then(|host| host.current()) {
+                        f(&session);
                     }
                 })
                 .build()
@@ -624,27 +526,397 @@ impl Bishop {
                     }
                 })
                 .build(),
-            action("zoom-in", |s| s.set_zoom(s.terminal.font_scale() + ZOOM_STEP)),
-            action("zoom-out", |s| s.set_zoom(s.terminal.font_scale() - ZOOM_STEP)),
-            action("zoom-reset", |s| s.set_zoom(1.0)),
-            action("copy", |s| s.focused_terminal().copy_clipboard_format(vte4::Format::Text)),
-            action("paste", |s| s.focused_terminal().paste_clipboard()),
-            action("agent-stop", |s| s.emergency_stop()),
-            action("agent-hard-stop", |s| {
+            action("new-tab", |h| h.add_tab()),
+            on_tab("close-tab", |s| {
+                if let Some(host) = s.host.upgrade() {
+                    host.close_tab(s);
+                }
+            }),
+            action("next-tab", |h| h.cycle(1)),
+            action("previous-tab", |h| h.cycle(-1)),
+            action("zoom-in", |h| h.set_zoom(h.zoom.get() + ZOOM_STEP)),
+            action("zoom-out", |h| h.set_zoom(h.zoom.get() - ZOOM_STEP)),
+            action("zoom-reset", |h| h.set_zoom(1.0)),
+            on_tab("copy", |s| s.focused_terminal().copy_clipboard_format(vte4::Format::Text)),
+            on_tab("paste", |s| s.focused_terminal().paste_clipboard()),
+            on_tab("agent-stop", |s| s.emergency_stop()),
+            on_tab("agent-hard-stop", |s| {
                 s.emergency_stop();
                 s.hard_stop();
             }),
-            action("agent-resume", |s| s.resume_agent()),
-            action("preferences", |s| prefs::show_preferences(&s.window)),
-            action("agent-config", |s| {
-                let state = Rc::downgrade(s);
+            on_tab("agent-resume", |s| s.resume_agent()),
+            action("preferences", |h| prefs::show_preferences(&h.window)),
+            on_tab("agent-config", |s| {
+                let session = Rc::downgrade(s);
                 prefs::show_agent_config(&s.window, move || {
-                    if let Some(state) = state.upgrade() {
-                        state.restart_agent();
+                    if let Some(session) = session.upgrade() {
+                        session.restart_agent();
                     }
                 });
             }),
         ]);
+    }
+
+    /// Opens a new tab at the right end of the tab bar and switches to it.
+    fn add_tab(self: &Rc<Self>) {
+        let number = self.next_tab.replace(self.next_tab.get() + 1);
+        let session = Session::new(self, &format!("{}-{number}", self.id));
+        self.stack.add_child(&session.page);
+        self.tab_bar.add(&session.tab);
+        self.sessions.borrow_mut().push(session.clone());
+        self.select(&session);
+    }
+
+    /// The tab that's showing.
+    fn current(&self) -> Option<Rc<Session>> {
+        let page = self.stack.visible_child()?;
+        self.sessions.borrow().iter().find(|s| s.page == page).cloned()
+    }
+
+    fn select(&self, session: &Rc<Session>) {
+        self.stack.set_visible_child(&session.page);
+        for other in self.sessions.borrow().iter() {
+            other.tab.set_selected(Rc::ptr_eq(other, session));
+        }
+        self.tab_bar.reveal(&session.tab);
+        self.sync_chrome();
+        session.focus();
+    }
+
+    /// Switches `step` tabs to the right (or left, if negative), wrapping around.
+    fn cycle(&self, step: isize) {
+        let next = {
+            let sessions = self.sessions.borrow();
+            let Some(current) = self.current() else { return };
+            let Some(index) = sessions.iter().position(|s| Rc::ptr_eq(s, &current)) else { return };
+            let count = sessions.len() as isize;
+            sessions[(index as isize + step).rem_euclid(count) as usize].clone()
+        };
+        self.select(&next);
+    }
+
+    /// Closes a tab and ends its shell and agent. Closing the last tab closes the window.
+    fn close_tab(&self, session: &Rc<Session>) {
+        let showing = self.stack.visible_child().as_ref() == Some(&session.page);
+        let index = {
+            let mut sessions = self.sessions.borrow_mut();
+            let Some(index) = sessions.iter().position(|s| Rc::ptr_eq(s, session)) else { return };
+            sessions.remove(index);
+            index
+        };
+        session.shutdown();
+        self.tab_bar.remove(&session.tab);
+        self.stack.remove(&session.page);
+        // Show the tab that took its place, or the new last one.
+        let next = {
+            let sessions = self.sessions.borrow();
+            sessions.get(index).or(sessions.last()).cloned()
+        };
+        match next {
+            None => self.window.close(),
+            Some(next) if showing => self.select(&next),
+            Some(_) => self.sync_chrome(),
+        }
+    }
+
+    fn close_all(&self) {
+        for session in self.sessions.take() {
+            session.shutdown();
+        }
+    }
+
+    /// Makes the header bar reflect the tab that's showing.
+    fn sync_chrome(&self) {
+        let Some(session) = self.current() else { return };
+        self.syncing.set(true);
+        self.agent_button.set_active(session.agent_pane.is_visible());
+        self.syncing.set(false);
+        let hard_stopped = session.hard_stopped.get();
+        self.agent_button.set_sensitive(!hard_stopped);
+        self.agent_button.set_tooltip_text(Some(if hard_stopped {
+            "Disconnected by Hard Stop. Open a new tab to use the agent."
+        } else {
+            "Show this tab's Claude Code panel"
+        }));
+        self.stop_button.set_visible(session.shows_stop());
+        let title = session.title.borrow();
+        self.title.set_subtitle(&title);
+        self.window.set_title(Some(if title.is_empty() { "Bishop" } else { &title }));
+    }
+
+    fn fullscreen_changed(&self, fullscreen: bool) {
+        self.toolbar.set_reveal_top_bars(!fullscreen);
+        for session in self.sessions.borrow().iter() {
+            session.update_floating_stop();
+        }
+        self.window.change_action_state("fullscreen", &fullscreen.to_variant());
+        if fullscreen && let Some(session) = self.current() {
+            session.toast("Press F11, or move the pointer to the top edge, to leave full screen");
+        }
+    }
+
+    /// Zoom applies to every tab in the window.
+    fn set_zoom(&self, scale: f64) {
+        let scale = ((scale * 10.0).round() / 10.0).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom.set(scale);
+        for session in self.sessions.borrow().iter() {
+            session.set_zoom(scale);
+        }
+        self.zoom_label.set_text(&format!("{:.0}%", scale * 100.0));
+    }
+}
+
+impl Session {
+    fn new(host: &Rc<Host>, id: &str) -> Rc<Self> {
+        let terminal = new_terminal();
+        let agent_terminal = new_terminal();
+        let terminal_pane = scrolled(&terminal);
+        let auto_switch = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .tooltip_text("When on, Claude types into your terminal without asking first")
+            .build();
+        let agent_pane = agent_pane(&agent_terminal, &auto_switch);
+
+        let banner = adw::Banner::new("Claude is typing in this terminal");
+        let approval = approval_bar();
+        let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let stopped_banner = adw::Banner::builder()
+            .title("Emergency stop: the agent can't type until you resume it")
+            .button_label("Resume Agent")
+            .build();
+        main_box.append(&stopped_banner);
+        main_box.append(&banner);
+        main_box.append(&approval.revealer);
+        main_box.append(&terminal_pane);
+
+        let paned = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .start_child(&main_box)
+            .end_child(&agent_pane)
+            .shrink_start_child(false)
+            .shrink_end_child(false)
+            .wide_handle(true)
+            .build();
+        // In full screen the header bar is hidden, so Emergency Stop floats over the terminal.
+        let floating_stop_button = emergency_stop_button();
+        floating_stop_button.set_halign(gtk::Align::End);
+        floating_stop_button.set_valign(gtk::Align::Start);
+        floating_stop_button.set_margin_top(12);
+        floating_stop_button.set_margin_end(12);
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&paned));
+        overlay.add_overlay(&floating_stop_button);
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&overlay));
+
+        let current = settings::get();
+        auto_switch.set_active(current.agent.automatic_mode);
+        terminal.set_font_scale(host.zoom.get());
+        agent_terminal.set_font_scale(host.zoom.get());
+
+        let dir = mcp::runtime_dir();
+        let state = Rc::new(Session {
+            host: Rc::downgrade(host),
+            window: host.window.clone(),
+            page: toasts.clone().upcast(),
+            tab: tabs::Tab::new(),
+            title: RefCell::new(String::new()),
+            terminal: terminal.clone(),
+            agent_terminal: agent_terminal.clone(),
+            agent_pane,
+            agent_running: Cell::new(false),
+            agent_pid: Cell::new(None),
+            restart_agent: Cell::new(false),
+            auto_switch: auto_switch.clone(),
+            auto_mode: Cell::new(current.agent.automatic_mode),
+            quiet_auto_toggle: Cell::new(false),
+            approval,
+            pending_approval: RefCell::new(None),
+            approval_details: RefCell::new(None),
+            approval_dialog: RefCell::new(None),
+            agent_busy: Cell::new(0),
+            last_agent_input: Cell::new(None),
+            cancel_generation: Cell::new(0),
+            shell_pid: Cell::new(None),
+            integration_seen: Cell::new(false),
+            shell_waiters: RefCell::new(Vec::new()),
+            shell_events: RefCell::new(None),
+            last_output: Cell::new(Instant::now()),
+            agent_started: Cell::new(false),
+            stopped: Cell::new(false),
+            hard_stopped: Cell::new(false),
+            terminating: Cell::new(false),
+            stop_clicks: RefCell::new(Vec::new()),
+            agent_driving_since: Cell::new(None),
+            agent_driving_spans: RefCell::new(Vec::new()),
+            floating_stop_button: floating_stop_button.clone(),
+            stopped_banner: stopped_banner.clone(),
+            mcp_server: RefCell::new(None),
+            paned,
+            paned_positioned: Cell::new(false),
+            banner,
+            banner_generation: Cell::new(0),
+            toasts,
+            socket_path: dir.join(format!("{id}.sock")),
+            mcp_config: dir.join(format!("{id}.mcp.json")),
+            session_id: id.to_owned(),
+        });
+
+        state.start_mcp_server();
+        state.apply_settings(&current);
+        let weak = Rc::downgrade(&state);
+        settings::subscribe(move |settings| {
+            weak.upgrade().inspect(|state| state.apply_settings(settings)).is_some()
+        });
+
+        let argv = shell::user_shell(&current.behavior.shell);
+        let weak = Rc::downgrade(&state);
+        let events = shell::Events::listen(dir.join(format!("{id}.events")), move |event| {
+            if let Some(state) = weak.upgrade() {
+                state.hook_event(event);
+            }
+        });
+        let (argv, env) = match &events {
+            Ok(events) => shell::with_hooks(&argv, events.path()),
+            Err(e) => {
+                state.toast(&format!("Shell integration unavailable: {e}"));
+                (argv, Vec::new())
+            }
+        };
+        state.shell_events.replace(events.ok());
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let env: Vec<&str> = env.iter().map(String::as_str).collect();
+        let weak = Rc::downgrade(&state);
+        spawn(&terminal, &argv, &env, &glib::home_dir(), move |pid| {
+            if let Some(state) = weak.upgrade() {
+                state.shell_pid.set(Some(pid));
+            }
+        });
+        state.connect_signals();
+        state
+    }
+
+    fn connect_signals(self: &Rc<Self>) {
+        let state = self;
+        self.terminal.connect_contents_changed(glib::clone!(
+            #[weak]
+            state,
+            move |_| state.last_output.set(Instant::now())
+        ));
+        // Any real keypress in the terminal while Claude is working hands control back to the user.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed(glib::clone!(
+            #[weak]
+            state,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, modifiers| {
+                if !is_modifier(key) && !is_shortcut(key, modifiers) {
+                    state.user_typed();
+                    state.take_over();
+                }
+                glib::Propagation::Proceed
+            }
+        ));
+        self.terminal.add_controller(keys);
+        // The shell exited: close its tab.
+        self.terminal.connect_child_exited(glib::clone!(
+            #[weak]
+            state,
+            move |_, _| {
+                if let Some(host) = state.host.upgrade() {
+                    host.close_tab(&state);
+                }
+            }
+        ));
+        // The title signal is deprecated in newer VTE (for termprops) but works in every version.
+        #[allow(deprecated)]
+        self.terminal.connect_window_title_changed(glib::clone!(
+            #[weak]
+            state,
+            move |term| {
+                #[allow(deprecated)]
+                let text = term.window_title().unwrap_or_default();
+                state.tab.set_title(&text);
+                state.title.replace(text.into());
+                state.chrome_changed();
+            }
+        ));
+
+        self.agent_terminal.connect_child_exited(glib::clone!(
+            #[weak]
+            state,
+            move |term, _| {
+                state.agent_running.set(false);
+                state.agent_pid.set(None);
+                if state.hard_stopped.get() {
+                    term.feed(b"\r\n[Hard stop: the agent is disconnected. Open a new tab to use it again.]\r\n");
+                    return;
+                }
+                if state.restart_agent.replace(false) {
+                    state.start_agent();
+                    return;
+                }
+                term.feed(b"\r\n[Claude Code exited. Toggle the Agent panel to restart it.]\r\n");
+                state.set_agent_visible(false);
+            }
+        ));
+        self.floating_stop_button.connect_clicked(glib::clone!(
+            #[weak]
+            state,
+            move |_| state.stop_clicked()
+        ));
+        self.stopped_banner.connect_button_clicked(glib::clone!(
+            #[weak]
+            state,
+            move |_| state.resume_agent()
+        ));
+        self.auto_switch.connect_active_notify(glib::clone!(
+            #[weak]
+            state,
+            move |switch| state.set_auto_mode(switch.is_active())
+        ));
+        self.approval.approve.connect_clicked(glib::clone!(
+            #[weak]
+            state,
+            move |_| state.resolve_approval(true)
+        ));
+        self.approval.deny.connect_clicked(glib::clone!(
+            #[weak]
+            state,
+            move |_| state.resolve_approval(false)
+        ));
+        self.approval.more.connect_clicked(glib::clone!(
+            #[weak]
+            state,
+            move |_| state.show_approval_details()
+        ));
+
+        // Clicking a tab shows it; middle-clicking or its close button closes it.
+        let click = gtk::GestureClick::builder().button(0).build();
+        click.connect_released(glib::clone!(
+            #[weak]
+            state,
+            move |gesture, _, _, _| {
+                let Some(host) = state.host.upgrade() else { return };
+                match gesture.current_button() {
+                    gdk::BUTTON_PRIMARY => host.select(&state),
+                    gdk::BUTTON_MIDDLE => host.close_tab(&state),
+                    _ => {}
+                }
+            }
+        ));
+        self.tab.root.add_controller(click);
+        self.tab.close.connect_clicked(glib::clone!(
+            #[weak]
+            state,
+            move |_| {
+                if let Some(host) = state.host.upgrade() {
+                    host.close_tab(&state);
+                }
+            }
+        ));
     }
 
     fn start_mcp_server(self: &Rc<Self>) {
@@ -686,15 +958,16 @@ impl Bishop {
 
     fn set_agent_visible(self: &Rc<Self>, visible: bool) {
         self.agent_pane.set_visible(visible);
-        if !visible {
+        if visible {
+            if !self.paned_positioned.replace(true) {
+                self.paned.set_position((self.paned.width() as f64 * 0.6) as i32);
+            }
+            self.start_agent();
+            self.agent_terminal.grab_focus();
+        } else {
             self.terminal.grab_focus();
-            return;
         }
-        if !self.paned_positioned.replace(true) {
-            self.paned.set_position((self.paned.width() as f64 * 0.6) as i32);
-        }
-        self.start_agent();
-        self.agent_terminal.grab_focus();
+        self.chrome_changed();
     }
 
     fn start_agent(self: &Rc<Self>) {
@@ -737,20 +1010,20 @@ impl Bishop {
         self.agent_terminal.reset(true, true);
         self.agent_running.set(true);
         self.agent_started.set(true);
-        self.update_stop_buttons();
+        self.update_floating_stop();
         let state = Rc::downgrade(self);
-        spawn(&self.agent_terminal, &argv, &workspace, move |pid| {
+        spawn(&self.agent_terminal, &argv, &[], &workspace, move |pid| {
             if let Some(state) = state.upgrade() {
                 state.agent_pid.set(Some(pid));
             }
         });
     }
 
-    /// Restarts Claude in this window's panel (showing the panel if hidden), so new agent
+    /// Restarts Claude in this tab's panel (showing the panel if hidden), so new agent
     /// settings take effect.
     fn restart_agent(self: &Rc<Self>) {
         if self.hard_stopped.get() {
-            self.toast("The agent was disconnected by a Hard Stop. Open a new window to use it again.");
+            self.toast("The agent was disconnected by a Hard Stop. Open a new tab to use it again.");
             return;
         }
         match self.agent_pid.get() {
@@ -761,14 +1034,43 @@ impl Bishop {
             }
             _ => {
                 self.agent_running.set(false);
-                if self.agent_button.is_active() {
+                if self.agent_pane.is_visible() {
                     self.start_agent();
                 } else {
-                    self.agent_button.set_active(true);
+                    self.set_agent_visible(true);
                 }
             }
         }
         self.toast("Restarting the agent");
+    }
+
+    /// The tab is closing: cut the agent off for good, and end Claude Code and the shell.
+    fn shutdown(&self) {
+        self.hard_stopped.set(true);
+        self.stopped.set(true);
+        self.restart_agent.set(false);
+        self.cancel_generation.set(self.cancel_generation.get() + 1);
+        self.resolve_approval(false);
+        self.close_approval_dialog();
+        if let Some(server) = self.mcp_server.take() {
+            server.disconnect();
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(&self.mcp_config);
+        self.shell_events.take();
+        // Claude Code leads its own process group: hang it up, then make sure.
+        if let Some(pid) = self.agent_pid.take() {
+            unsafe { libc::kill(-pid.0, libc::SIGHUP) };
+            glib::timeout_add_local_once(AGENT_EXIT_GRACE, move || {
+                if !crate::procs::in_group(pid.0).is_empty() {
+                    unsafe { libc::kill(-pid.0, libc::SIGKILL) };
+                }
+            });
+        }
+        // As when a terminal window closes: the shell hangs up its jobs and exits.
+        if let Some(pid) = self.shell_pid.get() {
+            unsafe { libc::kill(pid.0, libc::SIGHUP) };
+        }
     }
 
     fn apply_settings(&self, settings: &Settings) {
@@ -823,28 +1125,49 @@ impl Bishop {
         });
     }
 
-    /// Emergency Stop is visible once the agent has started here, and in full screen it
-    /// floats over the terminal so it's never hidden. A Hard Stop retires it.
-    fn update_stop_buttons(&self) {
-        let show = self.agent_started.get() && !self.hard_stopped.get();
-        self.stop_button.set_visible(show);
-        self.floating_stop_button.set_visible(show && self.window.is_fullscreen());
+    /// Emergency Stop shows once the agent has started in this tab, until a Hard Stop.
+    fn shows_stop(&self) -> bool {
+        self.agent_started.get() && !self.hard_stopped.get()
     }
 
-    fn fullscreen_changed(&self, fullscreen: bool) {
-        self.toolbar.set_reveal_top_bars(!fullscreen);
-        self.update_stop_buttons();
-        self.window.change_action_state("fullscreen", &fullscreen.to_variant());
-        if fullscreen {
-            self.toast("Press F11, or move the pointer to the top edge, to leave full screen");
+    /// In full screen, Emergency Stop floats over the terminal so it's never hidden.
+    fn update_floating_stop(&self) {
+        self.floating_stop_button.set_visible(self.shows_stop() && self.window.is_fullscreen());
+        self.chrome_changed();
+    }
+
+    /// Something shown in the tab bar or header bar changed.
+    fn chrome_changed(&self) {
+        self.refresh_tab();
+        if let Some(host) = self.host.upgrade() {
+            host.sync_chrome();
         }
     }
 
+    /// Shows what the agent is doing on the tab, so it's visible from other tabs.
+    fn refresh_tab(&self) {
+        let activity = if self.stopped.get() || self.hard_stopped.get() {
+            tabs::Activity::Stopped
+        } else if self.pending_approval.borrow().is_some() {
+            tabs::Activity::Waiting
+        } else if self.agent_busy.get() > 0 {
+            tabs::Activity::Busy
+        } else {
+            tabs::Activity::Idle
+        };
+        self.tab.set_activity(activity);
+    }
+
+    fn focus(&self) {
+        if self.agent_pane.is_visible() && self.agent_terminal.has_focus() {
+            return;
+        }
+        self.terminal.grab_focus();
+    }
+
     fn set_zoom(&self, scale: f64) {
-        let scale = ((scale * 10.0).round() / 10.0).clamp(MIN_ZOOM, MAX_ZOOM);
         self.terminal.set_font_scale(scale);
         self.agent_terminal.set_font_scale(scale);
-        self.zoom_label.set_text(&format!("{:.0}%", scale * 100.0));
     }
 
     fn focused_terminal(&self) -> &vte4::Terminal {
@@ -864,8 +1187,9 @@ pub fn agent_dir() -> PathBuf {
     glib::user_data_dir().join("bishop").join("agent")
 }
 
-/// `~/.local/share/bishop/agent`: the agent panel's working directory, holding the Bishop
-/// guide as CLAUDE.md so Claude Code loads it as project memory.
+/// `~/.local/share/bishop/agent`: every agent panel's working directory, holding the Bishop
+/// guide as CLAUDE.md so Claude Code loads it as project memory. All tabs share it, and so
+/// share their memory.
 fn agent_workspace() -> std::io::Result<PathBuf> {
     let dir = agent_dir();
     std::fs::create_dir_all(&dir)?;

@@ -1,9 +1,11 @@
 mod bridge;
+mod compat;
 mod mcp;
 mod prefs;
 mod procs;
 mod safety;
 mod settings;
+mod shell;
 mod window;
 
 use adw::prelude::*;
@@ -33,6 +35,9 @@ fn main() -> glib::ExitCode {
 
 fn startup(app: &adw::Application) {
     settings::load();
+    if let Err(e) = shell::install_hooks() {
+        eprintln!("bishop: could not install shell integration: {e}");
+    }
 
     // Development builds run from the source tree: load icons from ./data/icons. Installed
     // builds use the system icon theme.
@@ -60,19 +65,30 @@ fn startup(app: &adw::Application) {
     app.set_accels_for_action("win.copy", &["<Ctrl><Shift>c"]);
     app.set_accels_for_action("win.paste", &["<Ctrl><Shift>v"]);
     app.set_accels_for_action("win.agent-stop", &["<Ctrl><Shift>Escape"]);
+    app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>t"]);
+    app.set_accels_for_action("win.close-tab", &["<Ctrl><Shift>w"]);
+    app.set_accels_for_action("win.next-tab", &["<Ctrl>Page_Down"]);
+    app.set_accels_for_action("win.previous-tab", &["<Ctrl>Page_Up"]);
 }
 
 /// With background opacity below 100%, windows get `.translucent`: the window and the
 /// terminal widgets' theme background (libadwaita paints `vte-terminal` with the view
 /// color, underneath VTE's own background) become transparent so VTE's translucent
-/// background shows the desktop. The header bar and `.solid` controls stay opaque.
+/// background shows the desktop. The header bar, tab bar and `.solid` controls stay opaque.
 fn load_css() {
     let Some(display) = gtk::gdk::Display::default() else { return };
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
         "window.translucent, window.translucent vte-terminal { background-color: transparent; }
-         window.translucent headerbar { background-color: @headerbar_bg_color; }
-         window.translucent .solid { background-color: @window_bg_color; }",
+         window.translucent headerbar,
+         window.translucent toolbarview > .top-bar { background-color: @headerbar_bg_color; }
+         window.translucent .solid,
+         window.translucent paned > separator { background-color: @window_bg_color; }
+         .bishop-tabbar { background-color: @headerbar_bg_color; padding: 0 6px 6px 6px; }
+         .bishop-tab { border-radius: 8px; padding: 2px 2px 2px 10px; margin: 0 2px; min-height: 30px; }
+         .bishop-tab:hover { background-color: alpha(currentColor, 0.07); }
+         .bishop-tab.selected { background-color: alpha(currentColor, 0.15); }
+         .bishop-tab button { min-width: 24px; min-height: 24px; padding: 0; }",
     );
     gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 }

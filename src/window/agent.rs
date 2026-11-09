@@ -1,6 +1,5 @@
-//! The agent's side of a window: MCP tool calls, approvals, guardrails, and takeover.
+//! The agent's side of a tab: MCP tool calls, approvals, guardrails, and takeover.
 
-use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -10,7 +9,7 @@ use gtk::glib;
 use serde_json::{Value, json};
 use vte4::prelude::*;
 
-use super::Bishop;
+use super::Session;
 use crate::safety;
 
 /// How often waits re-check the terminal.
@@ -33,31 +32,43 @@ const HARD_STOPPED: &str = "Hard stop: the user disconnected you from this termi
 const PASSWORD_BLOCKED: &str = "Blocked: the terminal is at a password prompt, and Bishop never \
 lets the agent type there. Ask the user to enter it themselves (you may send only ctrl-c to cancel).";
 
+/// The shell hook's message travels separately from the terminal output, so it can arrive
+/// before VTE has drawn the command's last output and the new prompt. Once it does, the screen
+/// is read when the cursor has reached the prompt line and output has been quiet this long,
+/// or after `MAX_SETTLE` regardless.
+const SETTLE: Duration = Duration::from_millis(80);
+const MAX_SETTLE: Duration = Duration::from_millis(2000);
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ShellEvent {
-    /// A command started; its output begins on `row`.
-    Preexec { row: i64 },
-    /// The shell is about to draw its prompt at `row`/`col`; `exit` is the last command's status.
-    Precmd { row: i64, col: i64, exit: Option<u64> },
+    /// The command finished with status `exit`; the shell is about to draw its prompt.
+    Finished { exit: Option<u64> },
 }
 
+/// The approval bar shows at most this many characters of the input, and of the warning;
+/// See More opens the whole thing in its own window.
+const PREVIEW_CHARS: usize = 160;
+const WARNING_PREVIEW_CHARS: usize = 160;
+
 /// Counts an in-flight agent operation for as long as it is alive.
-struct Busy<'a>(&'a Cell<u32>);
+struct Busy<'a>(&'a Session);
 
 impl<'a> Busy<'a> {
-    fn new(count: &'a Cell<u32>) -> Self {
-        count.set(count.get() + 1);
-        Self(count)
+    fn new(session: &'a Session) -> Self {
+        session.agent_busy.set(session.agent_busy.get() + 1);
+        session.refresh_tab();
+        Self(session)
     }
 }
 
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        self.0.set(self.0.get() - 1);
+        self.0.agent_busy.set(self.0.agent_busy.get() - 1);
+        self.0.refresh_tab();
     }
 }
 
-impl Bishop {
+impl Session {
     pub(super) async fn handle_tool(self: &Rc<Self>, name: &str, args: &Value) -> Result<String, String> {
         if self.hard_stopped.get() {
             return Err(HARD_STOPPED.into());
@@ -82,7 +93,7 @@ impl Bishop {
             return Err("nothing to send: provide `text` and/or `keys`".into());
         }
         self.authorize("send_keys", &describe_input(args), &bytes).await?;
-        let _busy = Busy::new(&self.agent_busy);
+        let _busy = Busy::new(self);
         self.type_input(&bytes)?;
         let wait = args["wait_ms"].as_u64().unwrap_or(500).min(10_000);
         glib::timeout_future(Duration::from_millis(wait)).await;
@@ -101,19 +112,23 @@ impl Bishop {
         let bytes = format!("{command}\r").into_bytes();
         self.authorize("run_command", &format!("{command} ⏎"), &bytes).await?;
 
-        let _busy = Busy::new(&self.agent_busy);
+        let _busy = Busy::new(self);
         let generation = self.cancel_generation.get();
         let tracked = self.at_local_prompt();
         let (tx, events) = async_channel::unbounded();
         self.shell_waiters.borrow_mut().push(tx);
-        let start_row = self.terminal.cursor_position().1;
+        let (start_col, start_row) = self.terminal.cursor_position();
+        // Output starts on the line after the command, which may wrap over several lines.
+        let columns = self.terminal.column_count().max(1);
+        let end = start_col + command.chars().count() as i64;
+        let output_row = start_row + ((end + columns - 1) / columns).max(1);
         let prompt = self.cursor_line();
         self.type_input(&bytes)?;
 
         if tracked {
-            self.wait_for_prompt(events, start_row, &prompt, timeout, generation).await
+            self.wait_for_prompt(events, output_row, &prompt, timeout, generation).await
         } else {
-            self.wait_until_quiet(start_row, timeout, generation).await
+            self.wait_until_quiet(output_row, &prompt, timeout, generation).await
         }
     }
 
@@ -121,13 +136,12 @@ impl Bishop {
     async fn wait_for_prompt(
         &self,
         events: async_channel::Receiver<ShellEvent>,
-        start_row: i64,
+        output_row: i64,
         prompt: &str,
         timeout: Duration,
         generation: u64,
     ) -> Result<String, String> {
         let deadline = Instant::now() + timeout;
-        let mut output_row = start_row + 1;
         loop {
             if self.cancel_generation.get() != generation {
                 return Err(self.interruption());
@@ -136,11 +150,15 @@ impl Bishop {
                 return Ok(self.still_running(timeout));
             }
             match glib::future_with_timeout(POLL, events.recv()).await {
-                Ok(Ok(ShellEvent::Preexec { row })) => output_row = row,
-                Ok(Ok(ShellEvent::Precmd { .. })) if self.cancel_generation.get() != generation => {
+                Ok(Ok(ShellEvent::Finished { .. })) if self.cancel_generation.get() != generation => {
                     return Err(self.interruption());
                 }
-                Ok(Ok(ShellEvent::Precmd { row, col, exit })) => {
+                Ok(Ok(ShellEvent::Finished { exit })) => {
+                    self.settle(output_row, prompt).await;
+                    if self.cancel_generation.get() != generation {
+                        return Err(self.interruption());
+                    }
+                    let (col, row) = self.terminal.cursor_position();
                     let output = self.output_before(output_row, row, col, prompt);
                     let exit = exit.map_or("unknown".to_owned(), |code| code.to_string());
                     return Ok(format!("Exit code: {exit}\n\n{}", limit_output(&output)));
@@ -151,9 +169,31 @@ impl Bishop {
         }
     }
 
+    /// Waits for VTE to catch up with the shell after a finished-command event: the cursor on
+    /// or past the line where the prompt must start, showing a prompt, and output quiet.
+    async fn settle(&self, output_row: i64, prompt: &str) {
+        let started = Instant::now();
+        let prompt = prompt.trim_end();
+        while started.elapsed() < MAX_SETTLE {
+            let line = self.cursor_line();
+            let at_prompt = self.terminal.cursor_position().1 >= output_row
+                && (looks_like_prompt(&line) || (!prompt.is_empty() && line.starts_with(prompt)));
+            if at_prompt && self.last_output.get().elapsed() >= SETTLE {
+                return;
+            }
+            glib::timeout_future(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Without shell integration (e.g. over SSH): finished once output has gone quiet and
     /// the cursor line looks like a prompt.
-    async fn wait_until_quiet(&self, start_row: i64, timeout: Duration, generation: u64) -> Result<String, String> {
+    async fn wait_until_quiet(
+        &self,
+        output_row: i64,
+        prompt: &str,
+        timeout: Duration,
+        generation: u64,
+    ) -> Result<String, String> {
         let started = Instant::now();
         loop {
             glib::timeout_future(POLL).await;
@@ -162,8 +202,8 @@ impl Bishop {
             }
             let quiet = self.last_output.get().elapsed() >= QUIET && started.elapsed() >= QUIET;
             if quiet && looks_like_prompt(&self.cursor_line()) {
-                let row = self.terminal.cursor_position().1;
-                let output = self.output_before(start_row + 1, row, 0, "");
+                let (col, row) = self.terminal.cursor_position();
+                let output = self.output_before(output_row, row, col, prompt);
                 return Ok(format!(
                     "The command appears finished: output stopped and a prompt is showing. This \
                      session has no shell integration (for example, it's connected over SSH), so the \
@@ -191,7 +231,7 @@ impl Bishop {
         let pattern = args["pattern"].as_str().ok_or("`pattern` is required")?;
         let regex = regex::Regex::new(pattern).map_err(|e| format!("invalid pattern: {e}"))?;
         let timeout = Duration::from_millis(args["timeout_ms"].as_u64().unwrap_or(30_000).clamp(100, 600_000));
-        let _busy = Busy::new(&self.agent_busy);
+        let _busy = Busy::new(self);
         let generation = self.cancel_generation.get();
         let start_row = self.terminal.cursor_position().1;
         let started = Instant::now();
@@ -262,12 +302,16 @@ impl Bishop {
         if let Some(previous) = self.pending_approval.replace(Some(tx)) {
             let _ = previous.try_send(false);
         }
+        self.close_approval_dialog();
         let bar = &self.approval;
-        bar.label.set_text(display);
+        let warning_text = warning.map(|reason| format!("⚠ This looks destructive: it {reason}. Check it carefully."));
+        let (input_preview, input_cut) = preview(display, PREVIEW_CHARS);
+        let (warning_preview, warning_cut) = preview(warning_text.as_deref().unwrap_or_default(), WARNING_PREVIEW_CHARS);
+        bar.label.set_text(&input_preview);
         bar.warning.set_visible(warning.is_some());
-        bar.warning.set_text(&warning.map_or(String::new(), |reason| {
-            format!("⚠ This looks destructive: it {reason}. Check it carefully.")
-        }));
+        bar.warning.set_text(&warning_preview);
+        bar.more.set_visible(input_cut || warning_cut);
+        self.approval_details.replace(Some((display.to_owned(), warning_text)));
         if warning.is_some() {
             bar.approve.remove_css_class("suggested-action");
             bar.approve.add_css_class("destructive-action");
@@ -276,11 +320,125 @@ impl Bishop {
             bar.approve.add_css_class("suggested-action");
         }
         bar.revealer.set_reveal_child(true);
+        self.refresh_tab();
         let approved = rx.recv().await.unwrap_or(false);
         if self.pending_approval.borrow().is_none() {
             bar.revealer.set_reveal_child(false);
+            self.approval_details.take();
+            self.close_approval_dialog();
         }
+        self.refresh_tab();
         approved
+    }
+
+    /// See More: the whole input and warning in a scrollable window, with Confirm and Cancel.
+    pub(super) fn show_approval_details(self: &Rc<Self>) {
+        let Some((input, warning)) = self.approval_details.borrow().clone() else { return };
+        self.close_approval_dialog();
+
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(18)
+            .margin_end(18)
+            .build();
+        if let Some(warning) = &warning {
+            content.append(
+                &gtk::Label::builder()
+                    .label(warning)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .selectable(true)
+                    .css_classes(["error", "heading"])
+                    .build(),
+            );
+        }
+        content.append(&gtk::Label::builder().label("Claude wants to type:").xalign(0.0).css_classes(["heading"]).build());
+        let text = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(8)
+            .right_margin(8)
+            .vexpand(true)
+            .css_classes(["card", "monospace"])
+            .build();
+        text.buffer().set_text(&input);
+        content.append(&text);
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&content)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+
+        let cancel = gtk::Button::builder().label("Cancel").build();
+        let confirm = gtk::Button::builder()
+            .label("Confirm")
+            .css_classes([if warning.is_some() { "destructive-action" } else { "suggested-action" }])
+            .build();
+        let buttons = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .halign(gtk::Align::End)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(18)
+            .margin_end(18)
+            .build();
+        buttons.append(&cancel);
+        buttons.append(&confirm);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+        toolbar.set_content(Some(&scroller));
+        toolbar.add_bottom_bar(&buttons);
+        let dialog = adw::Window::builder()
+            .title("Review Claude's Input")
+            .transient_for(&self.window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .default_width(720)
+            .default_height(480)
+            .content(&toolbar)
+            .build();
+
+        // The approval bar resolves the request and closes this window.
+        cancel.connect_clicked(glib::clone!(
+            #[weak(rename_to = state)]
+            self,
+            move |_| state.resolve_approval(false)
+        ));
+        confirm.connect_clicked(glib::clone!(
+            #[weak(rename_to = state)]
+            self,
+            move |_| state.resolve_approval(true)
+        ));
+        dialog.connect_close_request(glib::clone!(
+            #[weak(rename_to = state)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_| {
+                state.approval_dialog.take();
+                glib::Propagation::Proceed
+            }
+        ));
+        self.approval_dialog.replace(Some(dialog.clone()));
+        dialog.present();
+        cancel.grab_focus();
+    }
+
+    pub(super) fn close_approval_dialog(&self) {
+        let dialog = self.approval_dialog.take();
+        if let Some(dialog) = dialog {
+            dialog.close();
+        }
     }
 
     pub(super) fn resolve_approval(&self, approved: bool) {
@@ -371,16 +529,11 @@ impl Bishop {
         });
     }
 
-    /// Called for the shell's preexec/precmd termprop signals.
-    pub(super) fn shell_event(&self, prop: &str) {
+    /// The shell's integration hook reported a finished command.
+    pub(super) fn hook_event(&self, event: crate::shell::Event) {
         self.integration_seen.set(true);
-        let (col, row) = self.terminal.cursor_position();
-        let event = if prop == "vte.shell.preexec" {
-            ShellEvent::Preexec { row }
-        } else {
-            let exit = self.terminal.termprop_uint("vte.shell.postexec");
-            ShellEvent::Precmd { row, col, exit }
-        };
+        let crate::shell::Event::Precmd(exit) = event else { return };
+        let event = ShellEvent::Finished { exit };
         self.shell_waiters.borrow_mut().retain(|tx| tx.try_send(event).is_ok());
     }
 
@@ -451,9 +604,8 @@ impl Bishop {
 
     fn session_info(&self) -> String {
         let t = &self.terminal;
-        let title = t.termprop_string("xterm.title").0;
         #[allow(deprecated)]
-        let cwd = t.current_directory_uri();
+        let (title, cwd) = (t.window_title(), t.current_directory_uri());
         let (foreground, password_prompt) = self.pty_state();
         let info = json!({
             "title": title.as_deref(),
@@ -491,13 +643,21 @@ impl Bishop {
 
     pub(super) fn audit(&self, tool: &str, input: &str, decision: &str, warning: Option<&str>) {
         safety::audit(json!({
-            "window": self.window_id,
+            "tab": self.session_id,
             "tool": tool,
             "input": input,
             "decision": decision,
             "warning": warning,
             "foreground_process": self.pty_state().0,
         }));
+    }
+}
+
+/// At most `max` characters of `text`, and whether any were cut.
+fn preview(text: &str, max: usize) -> (String, bool) {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => (format!("{}…", text[..end].trim_end()), true),
+        None => (text.to_owned(), false),
     }
 }
 
@@ -619,6 +779,16 @@ mod tests {
         assert_eq!(strip_prompt("no newlinekim@web01:~$", prompt), "no newline");
         assert_eq!(strip_prompt("kim@web01:/tmp$", prompt), "");
         assert_eq!(strip_prompt("partial output", prompt), "partial output");
+    }
+
+    #[test]
+    fn previews_long_input() {
+        assert_eq!(preview("ls -la", 10), ("ls -la".to_owned(), false));
+        let long = "é".repeat(300);
+        let (shown, cut) = preview(&long, PREVIEW_CHARS);
+        assert!(cut);
+        assert_eq!(shown.chars().count(), PREVIEW_CHARS + 1);
+        assert!(shown.ends_with('…'));
     }
 
     #[test]
