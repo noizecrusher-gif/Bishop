@@ -36,6 +36,11 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.12.0" date="2026-11-25">
+      <description>
+        <p>Danger Mode: a password-protected switch that lets the assistant work without Bishop's safety checks in one tab.</p>
+      </description>
+    </release>
     <release version="0.11.1" date="2026-11-08">
       <description>
         <p>Tabs, each with its own assistant; packages for Ubuntu, Debian, Fedora, openSUSE and Arch; and security hardening from a full audit.</p>
