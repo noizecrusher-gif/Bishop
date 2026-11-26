@@ -3,6 +3,7 @@
 //! in the same workspace, so they share CLAUDE.md, personal instructions, and memory.
 
 mod agent;
+mod danger;
 mod stop;
 mod tabs;
 
@@ -91,6 +92,11 @@ struct Session {
     auto_mode: Cell<bool>,
     /// Set while Bishop itself flips the switch, to skip the usual toast.
     quiet_auto_toggle: Cell<bool>,
+    /// Danger Mode: Bishop's guardrails are off in this tab. Never saved; off in every new tab.
+    danger_switch: gtk::Switch,
+    danger_mode: Cell<bool>,
+    danger_row: gtk::Box,
+    danger_banner: adw::Banner,
     approval: ApprovalBar,
     pending_approval: RefCell<Option<async_channel::Sender<bool>>>,
     /// The full input and warning of the pending approval, for See More.
@@ -280,13 +286,12 @@ fn scrolled(terminal: &vte4::Terminal) -> gtk::ScrolledWindow {
         .build()
 }
 
-fn agent_pane(agent_terminal: &vte4::Terminal, auto_switch: &gtk::Switch) -> gtk::Box {
+fn agent_pane(agent_terminal: &vte4::Terminal, auto_switch: &gtk::Switch, danger_row: &gtk::Box) -> gtk::Box {
     let mode_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
         .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(12)
+                .margin_start(12)
         .margin_end(12)
         .build();
     mode_row.append(
@@ -301,6 +306,7 @@ fn agent_pane(agent_terminal: &vte4::Terminal, auto_switch: &gtk::Switch) -> gtk
     // background is translucent.
     let header = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["solid"]).build();
     header.append(&mode_row);
+    header.append(danger_row);
     header.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     let pane = gtk::Box::builder()
@@ -681,7 +687,23 @@ impl Session {
             .valign(gtk::Align::Center)
             .tooltip_text("When on, Claude types into your terminal without asking first")
             .build();
-        let agent_pane = agent_pane(&agent_terminal, &auto_switch);
+        let danger_switch = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .tooltip_text("When on, Bishop's safety checks are off in this tab: nothing is held for approval")
+            .build();
+        let danger_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .css_classes(["bishop-danger-row"])
+            .build();
+        danger_row.append(&gtk::Label::builder().label("Danger mode").xalign(0.0).hexpand(true).build());
+        danger_row.append(&danger_switch);
+        let agent_pane = agent_pane(&agent_terminal, &auto_switch, &danger_row);
+        let danger_banner = adw::Banner::builder()
+            .title("Danger Mode: Bishop's safety checks are off in this tab")
+            .button_label("Turn Off")
+            .css_classes(["bishop-danger"])
+            .build();
 
         let banner = adw::Banner::new("Claude is typing in this terminal");
         let approval = approval_bar();
@@ -691,6 +713,7 @@ impl Session {
             .button_label("Resume Agent")
             .build();
         main_box.append(&stopped_banner);
+        main_box.append(&danger_banner);
         main_box.append(&banner);
         main_box.append(&approval.revealer);
         main_box.append(&terminal_pane);
@@ -736,6 +759,10 @@ impl Session {
             auto_switch: auto_switch.clone(),
             auto_mode: Cell::new(current.agent.automatic_mode),
             quiet_auto_toggle: Cell::new(false),
+            danger_switch: danger_switch.clone(),
+            danger_mode: Cell::new(false),
+            danger_row,
+            danger_banner,
             approval,
             pending_approval: RefCell::new(None),
             approval_details: RefCell::new(None),
@@ -882,6 +909,16 @@ impl Session {
             #[weak]
             state,
             move |switch| state.set_auto_mode(switch.is_active())
+        ));
+        self.danger_switch.connect_active_notify(glib::clone!(
+            #[weak]
+            state,
+            move |switch| state.danger_switch_changed(switch.is_active())
+        ));
+        self.danger_banner.connect_button_clicked(glib::clone!(
+            #[weak]
+            state,
+            move |_| state.danger_switch.set_active(false)
         ));
         self.approval.approve.connect_clicked(glib::clone!(
             #[weak]

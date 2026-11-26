@@ -92,9 +92,15 @@ Bishop gives an AI agent your terminal, so it's built to keep that contained:
   always need approval. Approvals show hidden characters, always show the end of long input,
   apply to one input at a time, and are re-checked before typing. These rules are a safety net,
   not a guarantee: read what you approve.
+- **Danger Mode** (the switch under Automatic mode in the agent panel) turns those checks off
+  in one tab: nothing is held for being risky, and the agent may type at password prompts. With
+  automatic mode also on, the agent acts entirely on its own. Turning it on takes your login
+  password the first time after Bishop starts. It is never saved, so every new tab and every
+  start of Bishop begins with it off, and a red banner and tab marker show while it's on.
+  Emergency Stop, taking over by typing, and the audit log (which notes Danger Mode) still work.
 - **Secrets:** recognizable private keys, tokens and passwords on screen are hidden before the
   agent sees them (Agent Configuration → Hide Secrets from Claude). The agent can never type at
-  a password prompt.
+  a password prompt (unless Danger Mode is on).
 - **Audit log:** everything the agent types is logged to `~/.local/state/bishop/audit.log`
   (private to you) and to the system journal (`journalctl --user -t bishop` or
   `journalctl -t bishop`), which programs running as you can't edit.

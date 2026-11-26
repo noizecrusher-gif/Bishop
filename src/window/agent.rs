@@ -287,8 +287,11 @@ impl Session {
             self.audit(tool, display, "blocked: emergency stop", None);
             return Err(STOPPED.into());
         }
+        // Danger Mode lifts the guardrails: nothing is blocked or held for being risky (but
+        // Emergency Stop, takeover and, outside automatic mode, approvals still apply).
+        let danger = self.danger_mode.get();
         let (_, password_prompt) = self.pty_state();
-        if password_prompt && bytes != b"\x03" {
+        if password_prompt && bytes != b"\x03" && !danger {
             self.audit(tool, display, "blocked: password prompt", None);
             return Err(PASSWORD_BLOCKED.into());
         }
@@ -301,8 +304,9 @@ impl Session {
             self.audit(tool, display, "refused: another input awaits approval", warning);
             return Err(BUSY.into());
         }
-        if self.auto_mode.get() && warning.is_none() {
-            self.audit(tool, display, "automatic", None);
+        if self.auto_mode.get() && (warning.is_none() || danger) {
+            // The warning is still logged, to show what Danger Mode let through.
+            self.audit(tool, display, "automatic", warning);
             return Ok(());
         }
         let generation = self.cancel_generation.get();
@@ -321,7 +325,8 @@ impl Session {
         if self.stopped.get() {
             return Err(STOPPED.into());
         }
-        if (password_prompt && bytes != b"\x03") || self.foreground_group() != foreground {
+        let danger = self.danger_mode.get();
+        if (password_prompt && bytes != b"\x03" && !danger) || self.foreground_group() != foreground {
             self.audit(tool, display, "refused: terminal changed while waiting", warning);
             return Err(CHANGED.into());
         }
@@ -680,6 +685,7 @@ impl Session {
             "at_local_shell_prompt": self.at_local_prompt(),
             "shell_integration": self.integration_seen.get(),
             "automatic_mode": self.auto_mode.get(),
+            "danger_mode": self.danger_mode.get(),
         });
         serde_json::to_string_pretty(&info).unwrap_or_default()
     }
@@ -711,6 +717,7 @@ impl Session {
             "input": input,
             "decision": decision,
             "warning": warning,
+            "danger_mode": self.danger_mode.get(),
             "foreground_process": self.pty_state().0,
         }));
     }

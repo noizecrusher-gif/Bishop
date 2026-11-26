@@ -1,3 +1,4 @@
+mod auth;
 mod bridge;
 mod compat;
 mod mcp;
@@ -93,7 +94,11 @@ fn load_css() {
          .bishop-tab { border-radius: 8px; padding: 2px 2px 2px 10px; margin: 0 2px; min-height: 30px; }
          .bishop-tab:hover { background-color: alpha(currentColor, 0.07); }
          .bishop-tab.selected { background-color: alpha(currentColor, 0.15); }
-         .bishop-tab button { min-width: 24px; min-height: 24px; padding: 0; }",
+         .bishop-tab button { min-width: 24px; min-height: 24px; padding: 0; }
+         .bishop-tab.danger { box-shadow: inset 0 -3px @error_color; }
+         .bishop-danger-row { padding: 6px 12px; }
+         .bishop-danger-row.on { background-color: alpha(@error_color, 0.25); }
+         banner.bishop-danger > revealer > widget { background-color: alpha(@error_color, 0.35); }",
     );
     gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 }

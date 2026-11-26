@@ -311,6 +311,15 @@ impl Tab {
         }
     }
 
+    /// Marks the tab while Danger Mode is on in it.
+    pub fn set_danger(&self, on: bool) {
+        if on {
+            self.root.add_css_class("danger");
+        } else {
+            self.root.remove_css_class("danger");
+        }
+    }
+
     pub fn set_activity(&self, activity: Activity) {
         self.spinner.set_visible(activity == Activity::Busy);
         let (icon, class, tooltip) = match activity {
